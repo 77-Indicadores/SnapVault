@@ -246,7 +246,7 @@ async function uploadArtifacts(destination: Destination, source: Source, run: Ba
     if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
       const uploaded = await uploadToMicrosoftDrive(destination.config as any, destination.basePath, file, datedPrefix, microsoftCredentials);
       storedPath = uploaded.path;
-      await log("info", "Uploaded artifact to Microsoft Graph", { path: uploaded.path, drive: uploaded.drive.label });
+      await log("info", "Uploaded artifact to Microsoft Graph", { path: uploaded.path, drive: uploaded.drive.label, uploadMode: uploaded.uploadMode, sizeBytes: uploaded.sizeBytes, chunkSize: uploaded.chunkSize });
     } else if (hasRclone && destination.config.rcloneRemoteName) {
       const remote = `${destination.config.rcloneRemoteName}:${remotePath}`;
       const result = await runCommand("rclone", ["copyto", file, remote]);
