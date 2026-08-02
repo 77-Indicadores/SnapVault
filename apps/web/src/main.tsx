@@ -572,7 +572,7 @@ function MicrosoftIntegrationsPanel({ showNotice }: { showNotice: (notice: Notic
 }
 
 function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDone }: { data: AppData; onCreateSource: () => void; onCreateStorage: () => void; onClose: () => void; onDone: (runId?: string) => void }) {
-  const healthyDestinations = data.destinations.filter((destination) => destination.status === "healthy");
+  const healthyDestinations = data.destinations.filter(isUsableDestination);
   const preferredDestination = healthyDestinations[0];
   const [step, setStep] = useState(1);
   const [sourceType, setSourceType] = useState<SourceType>("postgres");
@@ -898,7 +898,7 @@ function PolicyWizard({ data, policy, onClose, onDone }: { data: AppData; policy
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const healthySources = data.sources.filter((item) => item.status === "healthy" || item.id === policy.sourceId);
-  const healthyDestinations = data.destinations.filter((item) => item.status === "healthy" || item.id === policy.destinationId);
+  const healthyDestinations = data.destinations.filter((item) => isUsableDestination(item) || item.id === policy.destinationId);
   const selectedSource = data.sources.find((item) => item.id === sourceId);
   useEffect(() => {
     if (!sourceId || !selectedSource) return;
@@ -1213,6 +1213,14 @@ function sourceScopeLabel(sourceType: SourceType, scope: SourceScope) {
   if (scope.mode === "all") return sourceType === "postgres" ? "Todos os databases" : "Todos os buckets";
   if (sourceType === "postgres") return `Database ${scope.database || "-"}`;
   return `Bucket ${scope.bucket || "-"}${scope.prefix ? `/${scope.prefix}` : ""}`;
+}
+
+function isUsableDestination(destination: Destination) {
+  if (destination.status !== "healthy") return false;
+  if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config?.mode === "graph") {
+    return Boolean(destination.config.driveId || destination.config.userPrincipalName || destination.config.siteId || (destination.config.hostname && destination.config.sitePath));
+  }
+  return true;
 }
 
 function retentionLabel(policy: BackupRoutine) {
