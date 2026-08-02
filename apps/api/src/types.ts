@@ -49,6 +49,8 @@ export type Destination = {
 };
 
 export type MicrosoftIntegration = {
+  id: string;
+  name: string;
   tenantId: string;
   clientId: string;
   encryptedClientSecret: string;
@@ -132,6 +134,7 @@ export type Database = {
   settings?: {
     microsoft?: MicrosoftIntegration | null;
   };
+  microsoftIntegrations?: MicrosoftIntegration[];
   users: User[];
   sessions: Session[];
   sources: Source[];

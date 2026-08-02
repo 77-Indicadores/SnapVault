@@ -11,6 +11,7 @@ import { publicMicrosoftConfig, publicUser, Store, withoutSecrets } from "./stor
 import { executeBackupRun } from "./backup.js";
 import { getMicrosoftDriveQuota, listMicrosoftSiteDrives, listMicrosoftSites, listMicrosoftUsers, microsoftCredentialStatus, testMicrosoftDestination } from "./microsoftGraph.js";
 import { verifyRestoreForRun } from "./restoreVerify.js";
+import { runCommand } from "./runner.js";
 
 const store = new Store(config.databasePath);
 const app = Fastify({ logger: true });
@@ -55,7 +56,9 @@ const policySchema = z.object({
 });
 
 const sourcePatchSchema = z.object({
-  name: z.string().min(1).optional()
+  name: z.string().min(1).optional(),
+  config: z.record(z.unknown()).optional(),
+  secrets: z.record(z.string()).optional()
 });
 
 const destinationPatchSchema = z.object({
@@ -66,6 +69,7 @@ const destinationPatchSchema = z.object({
 });
 
 const microsoftConfigSchema = z.object({
+  name: z.string().min(1).default("Microsoft"),
   tenantId: z.string().min(1),
   clientId: z.string().min(1),
   clientSecret: z.string().min(1).optional()
@@ -127,6 +131,78 @@ app.post("/api/v1/auth/logout", async (request, reply) => {
 
 app.get("/api/v1/auth/me", { preHandler: requireAuth }, async (request) => ({ user: publicUser((request as any).user) }));
 
+app.get("/api/v1/integrations/microsoft", { preHandler: requireAuth }, async () => {
+  const db = await store.read();
+  return { integrations: (db.microsoftIntegrations ?? []).map(publicMicrosoftIntegrationSafe) };
+});
+
+app.post("/api/v1/integrations/microsoft", { preHandler: requireAuth }, async (request) => {
+  const body = microsoftConfigSchema.parse(request.body);
+  if (!body.clientSecret) throw new Error("Client secret is required");
+  const integration = await store.update((db) => {
+    db.microsoftIntegrations = db.microsoftIntegrations ?? [];
+    const stamp = now();
+    const next = {
+      id: id("ms"),
+      name: body.name,
+      tenantId: body.tenantId,
+      clientId: body.clientId,
+      encryptedClientSecret: encryptText(body.clientSecret!, config.cookieSecret),
+      status: "untested" as const,
+      lastTestedAt: null,
+      createdAt: stamp,
+      updatedAt: stamp
+    };
+    db.microsoftIntegrations.push(next);
+    db.settings = db.settings ?? {};
+    db.settings.microsoft = db.settings.microsoft ?? next;
+    return publicMicrosoftIntegrationSafe(next);
+  });
+  return { integration };
+});
+
+app.patch("/api/v1/integrations/microsoft/:id", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const body = microsoftConfigSchema.partial().parse(request.body);
+  const integration = await store.update((db) => {
+    const target = (db.microsoftIntegrations ?? []).find((item) => item.id === params.id);
+    if (!target) throw new Error("Microsoft integration not found");
+    if (body.name) target.name = body.name;
+    if (body.tenantId) target.tenantId = body.tenantId;
+    if (body.clientId) target.clientId = body.clientId;
+    if (body.clientSecret) target.encryptedClientSecret = encryptText(body.clientSecret, config.cookieSecret);
+    target.status = "untested";
+    target.updatedAt = now();
+    return publicMicrosoftIntegrationSafe(target);
+  });
+  return { integration };
+});
+
+app.post("/api/v1/integrations/microsoft/:id/test", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const credentials = await microsoftCredentials(params.id);
+  const result = await microsoftCredentialStatus(credentials);
+  const integration = await store.update((db) => {
+    const target = (db.microsoftIntegrations ?? []).find((item) => item.id === params.id);
+    if (!target) throw new Error("Microsoft integration not found");
+    target.status = "healthy";
+    target.lastTestedAt = now();
+    target.updatedAt = now();
+    return publicMicrosoftIntegrationSafe(target);
+  });
+  return { ...result, integration };
+});
+
+app.delete("/api/v1/integrations/microsoft/:id", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  await store.update((db) => {
+    if (db.destinations.some((item) => item.config?.microsoftIntegrationId === params.id)) throw new Error("Microsoft integration is used by storage");
+    db.microsoftIntegrations = (db.microsoftIntegrations ?? []).filter((item) => item.id !== params.id);
+    if (db.settings?.microsoft?.id === params.id) db.settings.microsoft = db.microsoftIntegrations[0] ?? null;
+  });
+  return { ok: true };
+});
+
 app.get("/api/v1/integrations/microsoft/config", { preHandler: requireAuth }, async () => {
   const db = await store.read();
   const saved = publicMicrosoftConfig(db.settings);
@@ -153,7 +229,9 @@ app.put("/api/v1/integrations/microsoft/config", { preHandler: requireAuth }, as
     if (!clientSecret) throw new Error("Client secret is required");
     const stamp = now();
     db.settings = db.settings ?? {};
-    db.settings.microsoft = {
+    const next = {
+      id: previous?.id ?? id("ms"),
+      name: body.name ?? previous?.name ?? "Microsoft principal",
       tenantId: body.tenantId,
       clientId: body.clientId,
       encryptedClientSecret: encryptText(clientSecret, config.cookieSecret),
@@ -162,6 +240,11 @@ app.put("/api/v1/integrations/microsoft/config", { preHandler: requireAuth }, as
       createdAt: previous?.createdAt ?? stamp,
       updatedAt: stamp
     };
+    db.microsoftIntegrations = db.microsoftIntegrations ?? [];
+    const index = db.microsoftIntegrations.findIndex((item) => item.id === next.id);
+    if (index >= 0) db.microsoftIntegrations[index] = next as any;
+    else db.microsoftIntegrations.push(next as any);
+    db.settings.microsoft = next as any;
     return publicMicrosoftConfig(db.settings);
   });
   return saved;
@@ -182,15 +265,21 @@ app.post("/api/v1/integrations/microsoft/test", { preHandler: requireAuth }, asy
 });
 
 app.get("/api/v1/integrations/microsoft/status", { preHandler: requireAuth }, async () => microsoftCredentialStatus(await microsoftCredentials()));
-app.get("/api/v1/integrations/microsoft/users", { preHandler: requireAuth }, async () => listMicrosoftUsers(await microsoftCredentials()));
-app.get("/api/v1/integrations/microsoft/sites", { preHandler: requireAuth }, async () => listMicrosoftSites(await microsoftCredentials()));
+app.get("/api/v1/integrations/microsoft/users", { preHandler: requireAuth }, async (request) => {
+  const query = z.object({ integrationId: z.string().optional() }).parse(request.query);
+  return listMicrosoftUsers(await microsoftCredentials(query.integrationId));
+});
+app.get("/api/v1/integrations/microsoft/sites", { preHandler: requireAuth }, async (request) => {
+  const query = z.object({ integrationId: z.string().optional() }).parse(request.query);
+  return listMicrosoftSites(await microsoftCredentials(query.integrationId));
+});
 app.get("/api/v1/integrations/microsoft/site-drives", { preHandler: requireAuth }, async (request) => {
-  const query = z.object({ siteId: z.string() }).parse(request.query);
-  return listMicrosoftSiteDrives(query.siteId, await microsoftCredentials());
+  const query = z.object({ siteId: z.string(), integrationId: z.string().optional() }).parse(request.query);
+  return listMicrosoftSiteDrives(query.siteId, await microsoftCredentials(query.integrationId));
 });
 app.get("/api/v1/integrations/microsoft/drive-quota", { preHandler: requireAuth }, async (request) => {
-  const query = z.object({ driveId: z.string() }).parse(request.query);
-  return getMicrosoftDriveQuota(query.driveId, await microsoftCredentials());
+  const query = z.object({ driveId: z.string(), integrationId: z.string().optional() }).parse(request.query);
+  return getMicrosoftDriveQuota(query.driveId, await microsoftCredentials(query.integrationId));
 });
 
 app.get("/api/v1/sources", { preHandler: requireAuth }, async () => {
@@ -210,7 +299,21 @@ app.post("/api/v1/sources", { preHandler: requireAuth }, async (request) => {
 
 app.post("/api/v1/sources/:id/test", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  return markResource("source", params.id);
+  const db = await store.read();
+  const source = db.sources.find((item) => item.id === params.id);
+  if (!source) throw new Error("Source not found");
+  const result = source.type === "postgres" ? await testPostgresSource(source as any) : await testMinioSource(source as any);
+  await markResource("source", params.id, result);
+  return result;
+});
+
+app.get("/api/v1/sources/:id/resources", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const db = await store.read();
+  const source = db.sources.find((item) => item.id === params.id);
+  if (!source) throw new Error("Source not found");
+  if (source.type === "postgres") return testPostgresSource(source as any);
+  return testMinioSource(source as any);
 });
 
 app.patch("/api/v1/sources/:id", { preHandler: requireAuth }, async (request) => {
@@ -220,6 +323,7 @@ app.patch("/api/v1/sources/:id", { preHandler: requireAuth }, async (request) =>
     const target = db.sources.find((item) => item.id === params.id);
     if (!target) throw new Error("Source not found");
     Object.assign(target, body, { updatedAt: now() });
+    if (body.secrets) target.status = "untested";
     return withoutSecrets(target);
   });
   return { source };
@@ -256,7 +360,7 @@ app.post("/api/v1/destinations/:id/test", { preHandler: requireAuth }, async (re
   if (!destination) throw new Error("destination not found");
   if (destination.status === "archived") throw new Error("Archived storage cannot be tested until it is reactivated");
   if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
-    const result = await testMicrosoftDestination(destination.config as any, destination.basePath, await microsoftCredentials());
+    const result = await testMicrosoftDestination(destination.config as any, destination.basePath, await microsoftCredentials(String(destination.config.microsoftIntegrationId ?? "")));
     await markResource("destination", params.id, { quota: result.quota, checked: result.checked, drive: result.drive });
     return result;
   }
@@ -325,7 +429,9 @@ app.post("/api/v1/policies", { preHandler: requireAuth }, async (request) => {
   const created = now();
   const policy = { id: id("pol"), ...body, createdAt: created, updatedAt: created };
   await store.update((db) => {
-    if (!db.sources.some((item) => item.id === body.sourceId)) throw new Error("Source not found");
+    const source = db.sources.find((item) => item.id === body.sourceId);
+    if (!source) throw new Error("Source not found");
+    if (source.status !== "healthy") throw new Error("Source must be tested and healthy before creating a backup routine");
     const destination = db.destinations.find((item) => item.id === body.destinationId);
     if (!destination) throw new Error("Destination not found");
     if (destination.status !== "healthy") throw new Error("Destination must be tested and healthy before creating a backup routine");
@@ -359,6 +465,9 @@ app.post("/api/v1/policies/:id/run", { preHandler: requireAuth }, async (request
   const run = await store.update((db) => {
     const policy = db.policies.find((item) => item.id === params.id);
     if (!policy) throw new Error("Policy not found");
+    const source = db.sources.find((item) => item.id === policy.sourceId);
+    if (!source) throw new Error("Source not found");
+    if (source.status !== "healthy") throw new Error("Source must be healthy before running a backup");
     const destination = db.destinations.find((item) => item.id === policy.destinationId);
     if (!destination) throw new Error("Destination not found");
     if (destination.status !== "healthy") throw new Error("Destination must be healthy before running a backup");
@@ -443,9 +552,58 @@ async function markResource(kind: "source" | "destination", resourceId: string, 
   return { status: "healthy", resource: updated };
 }
 
-async function microsoftCredentials() {
+function publicMicrosoftIntegrationSafe(integration: any) {
+  return {
+    configured: true,
+    id: integration.id,
+    name: integration.name,
+    tenantId: integration.tenantId,
+    clientId: integration.clientId,
+    clientSecretSet: Boolean(integration.encryptedClientSecret),
+    status: integration.status,
+    lastTestedAt: integration.lastTestedAt,
+    updatedAt: integration.updatedAt
+  };
+}
+
+async function testPostgresSource(source: any) {
+  const sourceConfig = source.config as any;
+  const env = { PGPASSWORD: source.secrets?.password ?? "" };
+  const args = ["-h", String(sourceConfig.host), "-p", String(sourceConfig.port ?? 5432), "-U", String(sourceConfig.username), "-d", "postgres", "-tAc", "select datname from pg_database where datallowconn and not datistemplate order by datname"];
+  const result = await runCommand("psql", args, env);
+  if (result.code !== 0) throw new Error(result.stderr || "PostgreSQL connection failed");
+  const databases = result.stdout.split("\n").map((item) => item.trim()).filter(Boolean);
+  if (!databases.length) throw new Error("No accessible PostgreSQL databases found");
+  const selected = String(sourceConfig.database ?? "");
+  if (sourceConfig.scope !== "all" && selected && !databases.includes(selected)) throw new Error(`Database not found or not accessible: ${selected}`);
+  return { status: "healthy", kind: "postgres", resources: { databases }, selected: sourceConfig.scope === "all" ? "all" : selected || databases[0] };
+}
+
+async function testMinioSource(source: any) {
+  const sourceConfig = source.config as any;
+  const alias = `snapvault-test-${source.id}-${Date.now()}`;
+  const aliasResult = await runCommand("mc", ["alias", "set", alias, String(sourceConfig.endpoint), source.secrets?.accessKey ?? "", source.secrets?.secretKey ?? ""]);
+  if (aliasResult.code !== 0) throw new Error(aliasResult.stderr || "MinIO connection failed");
+  try {
+    const list = await runCommand("mc", ["ls", "--json", alias]);
+    if (list.code !== 0) throw new Error(list.stderr || "MinIO bucket listing failed");
+    const buckets = list.stdout.split("\n").map((line) => {
+      try { return JSON.parse(line).key?.replace(/\/$/, ""); } catch { return ""; }
+    }).filter(Boolean);
+    if (!buckets.length) throw new Error("No accessible MinIO buckets found");
+    const selected = String(sourceConfig.bucket ?? "");
+    if (sourceConfig.scope !== "all" && selected && !buckets.includes(selected)) throw new Error(`Bucket not found or not accessible: ${selected}`);
+    return { status: "healthy", kind: "minio", resources: { buckets }, selected: sourceConfig.scope === "all" ? "all" : selected || buckets[0] };
+  } finally {
+    await runCommand("mc", ["alias", "remove", alias]);
+  }
+}
+
+async function microsoftCredentials(integrationId?: string) {
   const db = await store.read();
-  const saved = db.settings?.microsoft;
+  const saved = integrationId
+    ? (db.microsoftIntegrations ?? []).find((item) => item.id === integrationId) ?? db.settings?.microsoft
+    : db.settings?.microsoft ?? (db.microsoftIntegrations ?? [])[0];
   if (saved?.tenantId && saved?.clientId && saved?.encryptedClientSecret) {
     return { tenantId: saved.tenantId, clientId: saved.clientId, clientSecret: decryptText(saved.encryptedClientSecret, config.cookieSecret) };
   }

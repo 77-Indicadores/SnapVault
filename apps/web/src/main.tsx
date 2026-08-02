@@ -26,9 +26,10 @@ import {
 import "./styles.css";
 
 const api = async (path: string, options: RequestInit = {}) => {
+  const headers = options.body ? { "Content-Type": "application/json", ...(options.headers ?? {}) } : options.headers;
   const res = await fetch(`/api/v1${path}`, {
     ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers ?? {}) },
+    headers,
     credentials: "include"
   });
   const data = await res.json().catch(() => ({}));
@@ -36,11 +37,11 @@ const api = async (path: string, options: RequestInit = {}) => {
   return data;
 };
 
-type View = "overview" | "backups" | "storage" | "settings";
+type View = "overview" | "backups" | "sources" | "storage" | "settings";
 type SourceType = "postgres" | "minio";
 type DestinationType = "sharepoint" | "onedrive";
 type Frequency = "manual" | "daily" | "weekly";
-type Source = { id: string; name: string; type: SourceType | string; status: string };
+type Source = { id: string; name: string; type: SourceType | string; status: string; config?: any; metadata?: any; lastTestedAt?: string | null };
 type Destination = { id: string; name: string; type: DestinationType | string; status: string; basePath: string; config?: any; metadata?: any; lastTestedAt?: string | null };
 type BackupRoutine = { id: string; name: string; sourceId: string; destinationId: string; enabled: boolean; schedule?: { type: string; time?: string; timezone?: string }; retention?: { keepLast: number; keepDays: number } };
 type Run = { id: string; policyId: string; sourceId?: string; destinationId?: string; status: string; verificationStatus?: string; verifiedAt?: string | null; createdAt: string; bytesWritten: number | null; errorMessage: string | null };
@@ -51,6 +52,7 @@ type Notice = { tone: "success" | "error"; text: string } | null;
 type MicrosoftSite = { id: string; displayName?: string; name?: string; webUrl?: string };
 type MicrosoftDrive = { id: string; name: string; webUrl?: string; quota?: any };
 type MicrosoftUser = { id: string; displayName?: string; mail?: string; userPrincipalName?: string };
+type MicrosoftIntegration = { id: string; name: string; tenantId: string; clientId: string; clientSecretSet: boolean; status: string; lastTestedAt?: string | null };
 
 const emptyData: AppData = { sources: [], destinations: [], policies: [], runs: [] };
 
@@ -60,6 +62,8 @@ function App() {
   const [data, setData] = useState<AppData>(emptyData);
   const [view, setView] = useState<View>("overview");
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [sourceOpen, setSourceOpen] = useState(false);
+  const [editingSource, setEditingSource] = useState<Source | null>(null);
   const [storageOpen, setStorageOpen] = useState(false);
   const [editingStorage, setEditingStorage] = useState<Destination | null>(null);
   const [selectedRunId, setSelectedRunId] = useState("");
@@ -149,9 +153,12 @@ function App() {
       {notice && <div className={`toast ${notice.tone}`}>{notice.text}</div>}
       {view === "overview" && <OverviewPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onRunOpen={setSelectedRunId} onPolicyOpen={(id) => { setSelectedPolicyId(id); setView("backups"); }} busy={busy} />}
       {view === "backups" && (selectedPolicyId ? <BackupDetailPage data={data} policyId={selectedPolicyId} onBack={() => setSelectedPolicyId("")} onRun={runNow} onRunOpen={setSelectedRunId} onToggle={togglePolicy} refresh={refresh} showNotice={showNotice} busy={busy} /> : <BackupsPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onRunOpen={setSelectedRunId} onPolicyOpen={setSelectedPolicyId} onToggle={togglePolicy} onDelete={deletePolicy} busy={busy} />)}
+      {view === "sources" && <SourcesPage data={data} refresh={refresh} openCreate={() => setSourceOpen(true)} openEdit={setEditingSource} showNotice={showNotice} />}
       {view === "storage" && <StoragePage data={data} refresh={refresh} openCreate={() => setStorageOpen(true)} openEdit={setEditingStorage} showNotice={showNotice} />}
       {view === "settings" && <SettingsPage user={user} onLogout={logout} showNotice={showNotice} />}
-      {wizardOpen && <NewBackupWizard data={data} onCreateStorage={() => setStorageOpen(true)} onClose={() => setWizardOpen(false)} onDone={async (runId) => { setWizardOpen(false); await refresh(); if (runId) setSelectedRunId(runId); setView("overview"); showNotice({ tone: "success", text: "Rotina criada e primeira execucao iniciada." }); }} />}
+      {wizardOpen && <NewBackupWizard data={data} onCreateSource={() => setSourceOpen(true)} onCreateStorage={() => setStorageOpen(true)} onClose={() => setWizardOpen(false)} onDone={async (runId) => { setWizardOpen(false); await refresh(); if (runId) setSelectedRunId(runId); setView("overview"); showNotice({ tone: "success", text: "Rotina criada e primeira execucao iniciada." }); }} />}
+      {sourceOpen && <SourceWizard onClose={() => setSourceOpen(false)} onDone={async () => { setSourceOpen(false); await refresh(); showNotice({ tone: "success", text: "Origem conectada e testada." }); }} />}
+      {editingSource && <SourceWizard source={editingSource} onClose={() => setEditingSource(null)} onDone={async () => { setEditingSource(null); await refresh(); showNotice({ tone: "success", text: "Origem atualizada." }); }} />}
       {storageOpen && <StorageWizard onClose={() => setStorageOpen(false)} onDone={async () => { setStorageOpen(false); await refresh(); showNotice({ tone: "success", text: "Armazenamento conectado e testado." }); }} />}
       {editingStorage && <StorageWizard destination={editingStorage} onClose={() => setEditingStorage(null)} onDone={async () => { setEditingStorage(null); await refresh(); showNotice({ tone: "success", text: "Armazenamento atualizado." }); }} />}
       {selectedRunId && <RunDetailModal runId={selectedRunId} onClose={() => setSelectedRunId("")} />}
@@ -160,7 +167,7 @@ function App() {
 }
 
 function AppShell({ children, user, view, setView, onNewBackup }: { children: React.ReactNode; user?: any; view?: View; setView?: (view: View) => void; onNewBackup?: () => void }) {
-  const nav: Array<[View, string]> = [["overview", "Overview"], ["backups", "Backups"], ["storage", "Storage"], ["settings", "Settings"]];
+  const nav: Array<[View, string]> = [["overview", "Overview"], ["backups", "Backups"], ["sources", "Sources"], ["storage", "Storage"], ["settings", "Settings"]];
   return (
     <main className="shell">
       <header className="topNav">
@@ -376,6 +383,52 @@ function StoragePage({ data, refresh, openCreate, openEdit, showNotice }: { data
   );
 }
 
+function SourcesPage({ data, refresh, openCreate, openEdit, showNotice }: { data: AppData; refresh: () => Promise<void>; openCreate: () => void; openEdit: (source: Source) => void; showNotice: (notice: Notice) => void }) {
+  const [busy, setBusy] = useState("");
+  const dependencyCount = (id: string) => data.policies.filter((item) => item.sourceId === id).length + data.runs.filter((item) => item.sourceId === id).length;
+  const testSource = async (id: string) => {
+    setBusy(id);
+    try {
+      await api(`/sources/${id}/test`, { method: "POST", body: "{}" });
+      await refresh();
+      showNotice({ tone: "success", text: "Origem testada com sucesso." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+  const deleteSource = async (source: Source) => {
+    if (dependencyCount(source.id) > 0) {
+      showNotice({ tone: "error", text: "Origem com backups vinculados nao pode ser apagada." });
+      return;
+    }
+    setBusy(source.id);
+    try {
+      await api(`/sources/${source.id}`, { method: "DELETE" });
+      await refresh();
+      showNotice({ tone: "success", text: "Origem removida." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+  return (
+    <>
+      <PageTitle eyebrow="Sources" title="O que proteger" text="Conexoes PostgreSQL e MinIO. Teste a conexao, liste databases ou buckets e defina o escopo." action={<button className="primaryButton" onClick={openCreate}><Plus size={15} /> Conectar</button>} />
+      <section className="sectionBlock">
+        {!data.sources.length ? <EmptyState title="Nenhuma origem" text="Conecte PostgreSQL ou MinIO antes de criar uma rotina." /> : (
+          <div className="itemList">{data.sources.map((source) => {
+            const scope = source.config?.scope === "all" ? "todos" : source.type === "postgres" ? source.config?.database : source.config?.bucket;
+            return <article className="listItem" key={source.id}><div className="itemMain"><strong>{source.name}</strong><span>{source.type} · {scope || "escopo nao definido"}</span></div><StatusBadge status={source.status} /><div className="rowActions"><button className="secondaryButton small" disabled={busy === source.id} onClick={() => testSource(source.id)}>{busy === source.id ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} Testar</button><button className="secondaryButton small" onClick={() => openEdit(source)}><Pencil size={14} /> Editar</button><button className="secondaryButton small" disabled={busy === source.id} onClick={() => deleteSource(source)}><Trash2 size={14} /> Excluir</button></div></article>;
+          })}</div>
+        )}
+      </section>
+    </>
+  );
+}
+
 function RestorePage({ data, onRunOpen, showNotice }: { data: AppData; onRunOpen: (id: string) => void; showNotice: (notice: Notice) => void }) {
   const [busy, setBusy] = useState("");
   const successfulRuns = data.runs.filter((run) => run.status === "success" || run.status === "verified" || run.status === "recoverable");
@@ -467,6 +520,7 @@ function SettingsPage({ user, onLogout, showNotice }: { user: any; onLogout: () 
         <InfoCard title="Conta" rows={[["Usuario", user.email], ["Perfil", user.role]]} />
         <InfoCard title="Operacao" rows={[["Ambiente", "self-hosted"], ["Segredos", "criptografados localmente"], ["Interface", "sem expor secret salvo"]]} />
       </section>
+      <MicrosoftIntegrationsPanel showNotice={showNotice} />
       <section className="sectionBlock settingsPanel">
         <SectionHeader title="Integracao Microsoft" action={<StatusBadge status={msConfig?.status ?? "untested"} />} />
         <div className="formGrid">
@@ -486,16 +540,91 @@ function SettingsPage({ user, onLogout, showNotice }: { user: any; onLogout: () 
   );
 }
 
-function NewBackupWizard({ data, onCreateStorage, onClose, onDone }: { data: AppData; onCreateStorage: () => void; onClose: () => void; onDone: (runId?: string) => void }) {
+function MicrosoftIntegrationsPanel({ showNotice }: { showNotice: (notice: Notice) => void }) {
+  const [items, setItems] = useState<MicrosoftIntegration[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const selected = items.find((item) => item.id === selectedId);
+  const [name, setName] = useState("Microsoft principal");
+  const [tenantId, setTenantId] = useState("");
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [busy, setBusy] = useState("");
+  const load = async () => {
+    const result = await api("/integrations/microsoft");
+    setItems(result.integrations ?? []);
+  };
+  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    if (!selected) return;
+    setName(selected.name);
+    setTenantId(selected.tenantId);
+    setClientId(selected.clientId);
+    setClientSecret("");
+  }, [selectedId]);
+  const save = async () => {
+    setBusy("save");
+    try {
+      const payload: any = { name, tenantId, clientId };
+      if (clientSecret) payload.clientSecret = clientSecret;
+      if (selectedId) await api(`/integrations/microsoft/${selectedId}`, { method: "PATCH", body: JSON.stringify(payload) });
+      else await api("/integrations/microsoft", { method: "POST", body: JSON.stringify(payload) });
+      await load();
+      setClientSecret("");
+      showNotice({ tone: "success", text: "Integracao Microsoft salva." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+  const test = async () => {
+    if (!selectedId) return showNotice({ tone: "error", text: "Salve a integracao antes de testar." });
+    setBusy("test");
+    try {
+      await api(`/integrations/microsoft/${selectedId}/test`, { method: "POST", body: "{}" });
+      await load();
+      showNotice({ tone: "success", text: "Microsoft Graph conectado." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+  const reset = () => {
+    setSelectedId("");
+    setName("Microsoft principal");
+    setTenantId("");
+    setClientId("");
+    setClientSecret("");
+  };
+  return (
+    <section className="sectionBlock settingsPanel">
+      <SectionHeader title="Multiplas integracoes Microsoft" action={<button className="secondaryButton small" onClick={reset}><Plus size={14} /> Nova</button>} />
+      {items.length > 0 && <div className="integrationStrip">{items.map((item) => <button key={item.id} className={selectedId === item.id ? "selected" : ""} onClick={() => setSelectedId(item.id)}><span>{item.name}</span><StatusBadge status={item.status} /></button>)}</div>}
+      <div className="formGrid">
+        <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} placeholder="Microsoft Cliente A" /></Field>
+        <Field label="Tenant ID"><input value={tenantId} onChange={(e) => setTenantId(e.target.value)} /></Field>
+        <Field label="Client ID"><input value={clientId} onChange={(e) => setClientId(e.target.value)} /></Field>
+        <Field label={selected?.clientSecretSet ? "Client Secret novo opcional" : "Client Secret"}><input type="password" value={clientSecret} onChange={(e) => setClientSecret(e.target.value)} /></Field>
+      </div>
+      <div className="settingsHint">Cada Storage escolhe uma integracao Microsoft. O secret salvo nunca e exibido de volta.</div>
+      <div className="footerActions">
+        <button className="secondaryButton" disabled={busy === "test" || !selectedId} onClick={test}>{busy === "test" ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />} Testar conexao</button>
+        <button className="primaryButton" disabled={busy === "save" || !tenantId || !clientId || (!clientSecret && !selected?.clientSecretSet)} onClick={save}>{busy === "save" ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Salvar</button>
+      </div>
+    </section>
+  );
+}
+
+function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDone }: { data: AppData; onCreateSource: () => void; onCreateStorage: () => void; onClose: () => void; onDone: (runId?: string) => void }) {
   const healthyDestinations = data.destinations.filter((destination) => destination.status === "healthy");
   const preferredDestination = healthyDestinations[0];
   const [step, setStep] = useState(1);
   const [sourceType, setSourceType] = useState<SourceType>("postgres");
   const [destinationType, setDestinationType] = useState<DestinationType>("sharepoint");
   const [frequency, setFrequency] = useState<Frequency>("daily");
-  const [selectedSourceId, setSelectedSourceId] = useState(data.sources.find((source) => source.type === "postgres")?.id ?? "");
+  const [selectedSourceId, setSelectedSourceId] = useState(data.sources.find((source) => source.type === "postgres" && source.status === "healthy")?.id ?? "");
   const [selectedDestinationId, setSelectedDestinationId] = useState(preferredDestination?.id ?? "");
-  const [sourceName, setSourceName] = useState("Production PostgreSQL");
   const [routineName, setRoutineName] = useState("Backup diario");
   const [keepLast, setKeepLast] = useState(7);
   const [keepDays, setKeepDays] = useState(30);
@@ -506,14 +635,8 @@ function NewBackupWizard({ data, onCreateStorage, onClose, onDone }: { data: App
     setBusy(true);
     setError("");
     try {
-      let sourceId = selectedSourceId;
-      if (!sourceId) {
-        const sourceBody = sourceType === "postgres"
-          ? { name: sourceName, type: "postgres", config: { host: "postgres", port: 5432, database: "app", username: "postgres" }, secrets: { password: "postgres" } }
-          : { name: sourceName || "MinIO uploads", type: "minio", config: { endpoint: "http://minio:9000", bucket: "uploads", prefix: "snapvault-tests" }, secrets: { accessKey: "minioadmin", secretKey: "minioadmin" } };
-        const source = await api("/sources", { method: "POST", body: JSON.stringify(sourceBody) });
-        sourceId = source.source.id;
-      }
+      const sourceId = selectedSourceId;
+      if (!sourceId) throw new Error("Conecte e teste uma origem antes de criar a rotina.");
       let destinationId = selectedDestinationId;
       if (!destinationId) throw new Error("Conecte e teste um armazenamento antes de criar a rotina.");
       const schedule = frequency === "manual" ? { type: "daily", time: "02:00", timezone: "America/Sao_Paulo" } : { type: frequency, time: "02:00", timezone: "America/Sao_Paulo" };
@@ -527,7 +650,7 @@ function NewBackupWizard({ data, onCreateStorage, onClose, onDone }: { data: App
     }
   };
 
-  const availableSources = data.sources.filter((source) => source.type === sourceType);
+  const availableSources = data.sources.filter((source) => source.type === sourceType && source.status === "healthy");
   return (
     <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Novo backup">
       <div className="wizard">
@@ -538,10 +661,11 @@ function NewBackupWizard({ data, onCreateStorage, onClose, onDone }: { data: App
         <Progress step={step} />
         {step === 1 && (
           <ChoiceGrid>
-            <Choice active={sourceType === "postgres"} icon={<Database size={18} />} title="PostgreSQL" text="Dump comprimido do banco configurado." onClick={() => { setSourceType("postgres"); setSelectedSourceId(data.sources.find((source) => source.type === "postgres")?.id ?? ""); setSourceName("Production PostgreSQL"); }} />
-            <Choice active={sourceType === "minio"} icon={<HardDrive size={18} />} title="MinIO" text="Snapshot do bucket ou prefixo selecionado." onClick={() => { setSourceType("minio"); setSelectedSourceId(data.sources.find((source) => source.type === "minio")?.id ?? ""); setSourceName("MinIO uploads"); }} />
-            {availableSources.length > 0 && <Field label="Origem existente"><select value={selectedSourceId} onChange={(e) => setSelectedSourceId(e.target.value)}><option value="">Criar nova origem</option>{availableSources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}</select></Field>}
-            {!selectedSourceId && <Field label="Nome da origem"><input value={sourceName} onChange={(e) => setSourceName(e.target.value)} /></Field>}
+            <Choice active={sourceType === "postgres"} icon={<Database size={18} />} title="PostgreSQL" text="Escolha um banco ou todos os bancos permitidos." onClick={() => { setSourceType("postgres"); setSelectedSourceId(data.sources.find((source) => source.type === "postgres" && source.status === "healthy")?.id ?? ""); }} />
+            <Choice active={sourceType === "minio"} icon={<HardDrive size={18} />} title="MinIO" text="Escolha um bucket ou todos os buckets permitidos." onClick={() => { setSourceType("minio"); setSelectedSourceId(data.sources.find((source) => source.type === "minio" && source.status === "healthy")?.id ?? ""); }} />
+            {availableSources.length > 0 && <Field label="Origem pronta"><select value={selectedSourceId} onChange={(e) => setSelectedSourceId(e.target.value)}><option value="">Escolha uma origem</option>{availableSources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}</select></Field>}
+            {!availableSources.length && <EmptyState compact title="Nenhuma origem pronta" text="Conecte PostgreSQL ou MinIO, liste databases/buckets e rode o teste." />}
+            <button className="secondaryButton full" onClick={onCreateSource}><Plus size={15} /> Conectar origem</button>
           </ChoiceGrid>
         )}
         {step === 2 && (
@@ -585,6 +709,105 @@ function NewBackupWizard({ data, onCreateStorage, onClose, onDone }: { data: App
   );
 }
 
+function SourceWizard({ source, onClose, onDone }: { source?: Source; onClose: () => void; onDone: () => void }) {
+  const editing = Boolean(source);
+  const [type, setType] = useState<SourceType>(source?.type === "minio" ? "minio" : "postgres");
+  const [name, setName] = useState(source?.name ?? "PostgreSQL");
+  const [host, setHost] = useState(String(source?.config?.host ?? "postgres"));
+  const [port, setPort] = useState(String(source?.config?.port ?? 5432));
+  const [database, setDatabase] = useState(String(source?.config?.database ?? ""));
+  const [username, setUsername] = useState(String(source?.config?.username ?? "postgres"));
+  const [password, setPassword] = useState("");
+  const [endpoint, setEndpoint] = useState(String(source?.config?.endpoint ?? "http://minio:9000"));
+  const [bucket, setBucket] = useState(String(source?.config?.bucket ?? ""));
+  const [prefix, setPrefix] = useState(String(source?.config?.prefix ?? ""));
+  const [accessKey, setAccessKey] = useState("");
+  const [secretKey, setSecretKey] = useState("");
+  const [scope, setScope] = useState<"single" | "all">(source?.config?.scope === "all" ? "all" : "single");
+  const [resources, setResources] = useState<string[]>([]);
+  const [draftId, setDraftId] = useState(source?.id ?? "");
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+
+  const buildBody = () => {
+    const body: any = type === "postgres"
+      ? { name, type, config: { host, port: Number(port), database, username, scope } }
+      : { name, type, config: { endpoint, bucket, prefix, scope } };
+    if (type === "postgres" && password) body.secrets = { password };
+    if (type === "minio" && (accessKey || secretKey)) body.secrets = { accessKey, secretKey };
+    return body;
+  };
+
+  const save = async () => {
+    const payload = buildBody();
+    if (draftId) return (await api(`/sources/${draftId}`, { method: "PATCH", body: JSON.stringify(payload) })).source;
+    const created = (await api("/sources", { method: "POST", body: JSON.stringify(payload) })).source;
+    setDraftId(created.id);
+    return created;
+  };
+
+  const testAndSave = async () => {
+    setBusy("test");
+    setError("");
+    try {
+      const saved = await save();
+      const result = await api(`/sources/${saved.id}/test`, { method: "POST", body: "{}" });
+      const nextResources = type === "postgres" ? result.resources.databases : result.resources.buckets;
+      setResources(nextResources);
+      if (scope === "single" && nextResources.length > 0) {
+        if (type === "postgres" && !database) setDatabase(nextResources[0]);
+        if (type === "minio" && !bucket) setBucket(nextResources[0]);
+      }
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const saveOnly = async () => {
+    setBusy("save");
+    setError("");
+    try {
+      await save();
+      onDone();
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label={editing ? "Editar origem" : "Conectar origem"}>
+      <div className="wizard compactWizard">
+        <header className="wizardHeader"><div><span>Source</span><h2>{editing ? "Editar origem" : "Conectar origem"}</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
+        <ChoiceGrid>
+          <Choice active={type === "postgres"} icon={<Database size={18} />} title="PostgreSQL" text="Liste databases e escolha um ou todos." onClick={() => { setType("postgres"); setName("PostgreSQL"); }} />
+          <Choice active={type === "minio"} icon={<HardDrive size={18} />} title="MinIO" text="Liste buckets e escolha um ou todos." onClick={() => { setType("minio"); setName("MinIO"); }} />
+          <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} /></Field>
+          {type === "postgres" ? <>
+            <div className="fieldPair"><Field label="Host"><input value={host} onChange={(e) => setHost(e.target.value)} /></Field><Field label="Porta"><input type="number" value={port} onChange={(e) => setPort(e.target.value)} /></Field></div>
+            <Field label="Usuario"><input value={username} onChange={(e) => setUsername(e.target.value)} /></Field>
+            <Field label={source ? "Senha nova opcional" : "Senha"}><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
+            <Field label="Escopo"><select value={scope} onChange={(e) => setScope(e.target.value as any)}><option value="single">Selecionar database</option><option value="all">Todos os databases acessiveis</option></select></Field>
+            {scope === "single" && <Field label="Database"><input value={database} onChange={(e) => setDatabase(e.target.value)} placeholder="teste e liste para evitar erro de nome" /></Field>}
+          </> : <>
+            <Field label="Endpoint"><input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} /></Field>
+            <div className="fieldPair"><Field label="Access Key"><input value={accessKey} onChange={(e) => setAccessKey(e.target.value)} /></Field><Field label={source ? "Secret Key nova opcional" : "Secret Key"}><input type="password" value={secretKey} onChange={(e) => setSecretKey(e.target.value)} /></Field></div>
+            <Field label="Escopo"><select value={scope} onChange={(e) => setScope(e.target.value as any)}><option value="single">Selecionar bucket</option><option value="all">Todos os buckets acessiveis</option></select></Field>
+            {scope === "single" && <Field label="Bucket"><input value={bucket} onChange={(e) => setBucket(e.target.value)} placeholder="teste e liste para evitar erro de nome" /></Field>}
+            <Field label="Prefixo opcional"><input value={prefix} onChange={(e) => setPrefix(e.target.value)} /></Field>
+          </>}
+          {resources.length > 0 && <Field label={type === "postgres" ? "Encontrados" : "Buckets encontrados"}><select value={type === "postgres" ? database : bucket} onChange={(e) => type === "postgres" ? setDatabase(e.target.value) : setBucket(e.target.value)}><option value="">Escolha</option>{resources.map((item) => <option key={item} value={item}>{item}</option>)}</select></Field>}
+        </ChoiceGrid>
+        {error && <p className="formError">{error}</p>}
+        <footer className="wizardFooter"><button className="secondaryButton" onClick={onClose}>Cancelar</button><div className="footerActions inline"><button className="secondaryButton" disabled={busy === "save"} onClick={saveOnly}>{busy === "save" ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Salvar</button><button className="primaryButton" disabled={busy === "test"} onClick={testAndSave}>{busy === "test" ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />} Testar e listar</button></div></footer>
+      </div>
+    </div>
+  );
+}
+
 function StorageWizard({ destination, onClose, onDone }: { destination?: Destination; onClose: () => void; onDone: () => void }) {
   const editing = Boolean(destination);
   const [type, setType] = useState<DestinationType>((destination?.type === "onedrive" ? "onedrive" : "sharepoint"));
@@ -593,6 +816,8 @@ function StorageWizard({ destination, onClose, onDone }: { destination?: Destina
   const [sites, setSites] = useState<MicrosoftSite[]>([]);
   const [drives, setDrives] = useState<MicrosoftDrive[]>([]);
   const [users, setUsers] = useState<MicrosoftUser[]>([]);
+  const [integrations, setIntegrations] = useState<MicrosoftIntegration[]>([]);
+  const [integrationId, setIntegrationId] = useState(String(destination?.config?.microsoftIntegrationId ?? ""));
   const [siteId, setSiteId] = useState(String(destination?.config?.siteId ?? ""));
   const [driveId, setDriveId] = useState(String(destination?.config?.driveId ?? ""));
   const [userPrincipalName, setUserPrincipalName] = useState(String(destination?.config?.userPrincipalName ?? ""));
@@ -602,24 +827,32 @@ function StorageWizard({ destination, onClose, onDone }: { destination?: Destina
   const [error, setError] = useState("");
 
   useEffect(() => {
-    api("/integrations/microsoft/sites").then((r) => setSites(r.sites ?? [])).catch((err) => setError(readableGraphError(err.message)));
-    api("/integrations/microsoft/users").then((r) => setUsers(r.users ?? [])).catch(() => setUsers([]));
+    api("/integrations/microsoft").then((r) => {
+      const list = r.integrations ?? [];
+      setIntegrations(list);
+      if (!integrationId && list[0]) setIntegrationId(list[0].id);
+    }).catch((err) => setError(readableGraphError(err.message)));
   }, []);
   useEffect(() => {
+    if (!integrationId) return;
+    api(`/integrations/microsoft/sites?integrationId=${encodeURIComponent(integrationId)}`).then((r) => setSites(r.sites ?? [])).catch((err) => setError(readableGraphError(err.message)));
+    api(`/integrations/microsoft/users?integrationId=${encodeURIComponent(integrationId)}`).then((r) => setUsers(r.users ?? [])).catch(() => setUsers([]));
+  }, [integrationId]);
+  useEffect(() => {
     if (!siteId || type !== "sharepoint") return;
-    api(`/integrations/microsoft/site-drives?siteId=${encodeURIComponent(siteId)}`).then((r) => setDrives(r.drives ?? [])).catch((err) => setError(readableGraphError(err.message)));
-  }, [siteId, type]);
+    api(`/integrations/microsoft/site-drives?siteId=${encodeURIComponent(siteId)}&integrationId=${encodeURIComponent(integrationId)}`).then((r) => setDrives(r.drives ?? [])).catch((err) => setError(readableGraphError(err.message)));
+  }, [siteId, type, integrationId]);
 
   const selectedSite = sites.find((item) => item.id === siteId);
   const selectedDrive = drives.find((item) => item.id === driveId);
   const selectedUser = users.find((item) => item.userPrincipalName === userPrincipalName);
 
   const buildConfig = () => {
-    if (advanced) return { mode: "graph", driveId };
-    if (type === "onedrive") return { mode: "graph", userPrincipalName, driveId, userName: selectedUser?.displayName ?? userPrincipalName };
-    return { mode: "graph", siteId, siteName: selectedSite?.displayName ?? selectedSite?.name ?? siteId, driveId, driveName: selectedDrive?.name ?? driveId };
+    if (advanced) return { mode: "graph", microsoftIntegrationId: integrationId, driveId };
+    if (type === "onedrive") return { mode: "graph", microsoftIntegrationId: integrationId, userPrincipalName, driveId, userName: selectedUser?.displayName ?? userPrincipalName };
+    return { mode: "graph", microsoftIntegrationId: integrationId, siteId, siteName: selectedSite?.displayName ?? selectedSite?.name ?? siteId, driveId, driveName: selectedDrive?.name ?? driveId };
   };
-  const canTest = advanced ? Boolean(driveId) : type === "onedrive" ? Boolean(userPrincipalName || driveId) : Boolean(siteId && driveId);
+  const canTest = Boolean(integrationId) && (advanced ? Boolean(driveId) : type === "onedrive" ? Boolean(userPrincipalName || driveId) : Boolean(siteId && driveId));
 
   const test = async () => {
     setBusy("test");
@@ -664,6 +897,7 @@ function StorageWizard({ destination, onClose, onDone }: { destination?: Destina
         <ChoiceGrid>
           <Choice active={type === "sharepoint"} icon={<Cloud size={18} />} title="SharePoint" text="Escolha site, biblioteca e pasta." onClick={() => { setType("sharepoint"); setName("SharePoint Backups"); }} />
           <Choice active={type === "onedrive"} icon={<Cloud size={18} />} title="OneDrive" text="Escolha o usuario e a pasta." onClick={() => { setType("onedrive"); setName("OneDrive Backups"); }} />
+          <Field label="Integracao Microsoft"><select value={integrationId} onChange={(e) => { setIntegrationId(e.target.value); setSiteId(""); setDriveId(""); }}><option value="">Escolha uma integracao</option>{integrations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
           <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} /></Field>
           {!advanced && type === "sharepoint" && <Field label="Site SharePoint"><select value={siteId} onChange={(e) => { setSiteId(e.target.value); setDriveId(""); }}><option value="">Escolha um site</option>{sites.map((site) => <option key={site.id} value={site.id}>{site.displayName || site.name || site.webUrl || site.id}</option>)}</select></Field>}
           {!advanced && type === "sharepoint" && <Field label="Biblioteca de documentos"><select value={driveId} onChange={(e) => setDriveId(e.target.value)} disabled={!siteId}><option value="">Escolha uma biblioteca</option>{drives.map((drive) => <option key={drive.id} value={drive.id}>{drive.name}</option>)}</select></Field>}
