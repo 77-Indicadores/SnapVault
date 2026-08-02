@@ -29,14 +29,13 @@ Crie o `.env` a partir do exemplo:
 cp .env.example .env
 ```
 
-Configure:
+Configure pelo menos a chave local:
 
 ```env
-MS_CLIENT_ID=
-MS_CLIENT_SECRET=
-MS_TENANT_ID=
 SNAPVAULT_SECRET_KEY=
 ```
+
+As credenciais Microsoft podem ser informadas pela interface em `Settings > Integracao Microsoft`. As variaveis `MS_CLIENT_ID`, `MS_CLIENT_SECRET` e `MS_TENANT_ID` continuam aceitas apenas como bootstrap/dev.
 
 Suba com Docker:
 
@@ -55,14 +54,28 @@ No primeiro acesso, crie o usuario administrador.
 ## Como funciona
 
 1. Voce cria uma rotina de backup.
-2. O SnapVault gera o dump/snapshot.
-3. O arquivo e validado localmente.
-4. O arquivo e enviado para Microsoft Graph.
-5. O SnapVault baixa o artefato remoto.
-6. O checksum remoto e conferido.
-7. Um restore temporario e executado.
-8. Se tudo passar, a execucao vira `recoverable`.
-9. A politica de retencao remove backups antigos preservando o minimo configurado.
+2. Voce escolhe um Storage ja testado.
+3. Para SharePoint, o SnapVault lista sites e bibliotecas pelo Microsoft Graph.
+4. O SnapVault gera o dump/snapshot.
+5. O arquivo e validado localmente.
+6. O arquivo e enviado para Microsoft Graph.
+7. O SnapVault baixa o artefato remoto.
+8. O checksum remoto e conferido.
+9. Um restore temporario e executado.
+10. Se tudo passar, a execucao vira `recoverable`.
+11. A politica de retencao remove backups antigos preservando o minimo configurado.
+
+No SharePoint, a hierarquia usada e:
+
+```txt
+Tenant Microsoft
+  -> Site SharePoint
+      -> Biblioteca de documentos
+          -> Pasta base
+              -> Arquivos de backup
+```
+
+Storages com historico nao sao apagados diretamente. Eles sao arquivados para preservar restore e auditoria.
 
 ## Documentacao
 

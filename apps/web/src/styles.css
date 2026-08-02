@@ -403,6 +403,12 @@ p {
   border-color: #fde68a;
 }
 
+.statusBadge.archived {
+  color: var(--secondary);
+  background: #f5f5f5;
+  border-color: var(--border-strong);
+}
+
 .rowActions {
   display: flex;
   align-items: center;
@@ -464,8 +470,63 @@ code {
 
 .settingsGrid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 20px;
+}
+
+.settingsPanel {
+  margin-top: 20px;
+}
+
+.formGrid {
+  padding: 20px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.settingsHint {
+  color: var(--secondary);
+  padding: 0 20px 18px;
+  font-size: 14px;
+}
+
+.footerActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 0 20px 20px;
+}
+
+.footerActions.inline {
+  padding: 0;
+}
+
+.linkButton {
+  color: var(--secondary);
+  justify-self: start;
+  min-height: 32px;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.quotaBox {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  display: grid;
+  gap: 4px;
+  background: var(--subtle);
+}
+
+.quotaBox span {
+  color: var(--secondary);
+  font-size: 13px;
+}
+
+.storageItem {
+  grid-template-columns: minmax(0, 1fr) auto minmax(320px, auto);
 }
 
 .authCard {
@@ -757,6 +818,20 @@ input::placeholder { color: #999; }
 
   .account {
     display: none;
+  }
+
+  .settingsGrid, .formGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .storageItem, .listItem {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .rowActions, .footerActions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .page {

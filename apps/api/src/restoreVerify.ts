@@ -1,11 +1,12 @@
 import { mkdir, rm, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { Store } from "./store.js";
-import { sha256File } from "./crypto.js";
+import { decryptText, sha256File } from "./crypto.js";
 import { runCommand } from "./runner.js";
 import { id, now } from "./ids.js";
 import type { BackupArtifact, Destination, JobLogEntry, Source } from "./types.js";
 import { downloadMicrosoftDrivePath } from "./microsoftGraph.js";
+import { config } from "./config.js";
 
 type Logger = (level: JobLogEntry["level"], message: string, data?: Record<string, unknown>) => Promise<void>;
 
@@ -24,7 +25,7 @@ export async function verifyRestoreForRun(store: Store, runId: string, stagingRo
   await mkdir(verifyDir, { recursive: true });
 
   try {
-    const localArtifact = await downloadArtifact(destination, artifact, verifyDir, log);
+    const localArtifact = await downloadArtifact(destination, artifact, verifyDir, log, await getMicrosoftCredentials(store));
     await verifyChecksum(localArtifact, artifact, log);
     const checkedArtifacts = source.type === "postgres"
       ? await verifyPostgresRestore(source, runId, localArtifact, log)
@@ -72,10 +73,10 @@ async function loadContext(store: Store, runId: string) {
   return { run, source, destination, artifact };
 }
 
-async function downloadArtifact(destination: Destination, artifact: BackupArtifact, verifyDir: string, log: Logger) {
+async function downloadArtifact(destination: Destination, artifact: BackupArtifact, verifyDir: string, log: Logger, microsoftCredentials?: any) {
   const localFile = join(verifyDir, basename(artifact.path));
   if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
-    const downloaded = await downloadMicrosoftDrivePath(destination.config as any, artifact.path, localFile);
+    const downloaded = await downloadMicrosoftDrivePath(destination.config as any, artifact.path, localFile, microsoftCredentials);
     await log("info", "Downloaded artifact from Microsoft Graph", { path: downloaded.path, sizeBytes: downloaded.sizeBytes });
     return localFile;
   }
@@ -84,6 +85,16 @@ async function downloadArtifact(destination: Destination, artifact: BackupArtifa
     return artifact.path;
   }
   throw new Error("Restore verification requires Microsoft Graph or a local artifact path");
+}
+
+async function getMicrosoftCredentials(store: Store) {
+  const db = await store.read();
+  const saved = db.settings?.microsoft;
+  if (saved?.tenantId && saved?.clientId && saved?.encryptedClientSecret) {
+    return { tenantId: saved.tenantId, clientId: saved.clientId, clientSecret: decryptText(saved.encryptedClientSecret, config.cookieSecret) };
+  }
+  if (config.microsoft.tenantId && config.microsoft.clientId && config.microsoft.clientSecret) return config.microsoft;
+  return undefined;
 }
 
 async function verifyChecksum(localFile: string, artifact: BackupArtifact, log: Logger) {

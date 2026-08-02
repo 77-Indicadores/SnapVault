@@ -13,6 +13,7 @@ import {
   Loader2,
   LogOut,
   Pause,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
@@ -40,13 +41,16 @@ type SourceType = "postgres" | "minio";
 type DestinationType = "sharepoint" | "onedrive";
 type Frequency = "manual" | "daily" | "weekly";
 type Source = { id: string; name: string; type: SourceType | string; status: string };
-type Destination = { id: string; name: string; type: DestinationType | string; status: string; basePath: string };
+type Destination = { id: string; name: string; type: DestinationType | string; status: string; basePath: string; config?: any; metadata?: any; lastTestedAt?: string | null };
 type BackupRoutine = { id: string; name: string; sourceId: string; destinationId: string; enabled: boolean; schedule?: { type: string; time?: string; timezone?: string }; retention?: { keepLast: number; keepDays: number } };
 type Run = { id: string; policyId: string; sourceId?: string; destinationId?: string; status: string; verificationStatus?: string; verifiedAt?: string | null; createdAt: string; bytesWritten: number | null; errorMessage: string | null };
 type Artifact = { id: string; kind: string; path: string; sizeBytes: number | null; checksumSha256: string | null };
 type RunDetail = { run: Run; logs: Array<{ message: string; level: string; createdAt: string }>; artifacts: Artifact[] };
 type AppData = { sources: Source[]; destinations: Destination[]; policies: BackupRoutine[]; runs: Run[] };
 type Notice = { tone: "success" | "error"; text: string } | null;
+type MicrosoftSite = { id: string; displayName?: string; name?: string; webUrl?: string };
+type MicrosoftDrive = { id: string; name: string; webUrl?: string; quota?: any };
+type MicrosoftUser = { id: string; displayName?: string; mail?: string; userPrincipalName?: string };
 
 const emptyData: AppData = { sources: [], destinations: [], policies: [], runs: [] };
 
@@ -57,6 +61,7 @@ function App() {
   const [view, setView] = useState<View>("overview");
   const [wizardOpen, setWizardOpen] = useState(false);
   const [storageOpen, setStorageOpen] = useState(false);
+  const [editingStorage, setEditingStorage] = useState<Destination | null>(null);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [selectedPolicyId, setSelectedPolicyId] = useState("");
   const [loading, setLoading] = useState(true);
@@ -144,10 +149,11 @@ function App() {
       {notice && <div className={`toast ${notice.tone}`}>{notice.text}</div>}
       {view === "overview" && <OverviewPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onRunOpen={setSelectedRunId} onPolicyOpen={(id) => { setSelectedPolicyId(id); setView("backups"); }} busy={busy} />}
       {view === "backups" && (selectedPolicyId ? <BackupDetailPage data={data} policyId={selectedPolicyId} onBack={() => setSelectedPolicyId("")} onRun={runNow} onRunOpen={setSelectedRunId} onToggle={togglePolicy} refresh={refresh} showNotice={showNotice} busy={busy} /> : <BackupsPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onRunOpen={setSelectedRunId} onPolicyOpen={setSelectedPolicyId} onToggle={togglePolicy} onDelete={deletePolicy} busy={busy} />)}
-      {view === "storage" && <StoragePage data={data} refresh={refresh} openCreate={() => setStorageOpen(true)} showNotice={showNotice} />}
-      {view === "settings" && <SettingsPage user={user} onLogout={logout} />}
-      {wizardOpen && <NewBackupWizard data={data} onClose={() => setWizardOpen(false)} onDone={async (runId) => { setWizardOpen(false); await refresh(); if (runId) setSelectedRunId(runId); setView("overview"); showNotice({ tone: "success", text: "Rotina criada e primeira execucao iniciada." }); }} />}
-      {storageOpen && <ConnectStorageModal onClose={() => setStorageOpen(false)} onDone={async () => { setStorageOpen(false); await refresh(); showNotice({ tone: "success", text: "Armazenamento conectado." }); }} />}
+      {view === "storage" && <StoragePage data={data} refresh={refresh} openCreate={() => setStorageOpen(true)} openEdit={setEditingStorage} showNotice={showNotice} />}
+      {view === "settings" && <SettingsPage user={user} onLogout={logout} showNotice={showNotice} />}
+      {wizardOpen && <NewBackupWizard data={data} onCreateStorage={() => setStorageOpen(true)} onClose={() => setWizardOpen(false)} onDone={async (runId) => { setWizardOpen(false); await refresh(); if (runId) setSelectedRunId(runId); setView("overview"); showNotice({ tone: "success", text: "Rotina criada e primeira execucao iniciada." }); }} />}
+      {storageOpen && <StorageWizard onClose={() => setStorageOpen(false)} onDone={async () => { setStorageOpen(false); await refresh(); showNotice({ tone: "success", text: "Armazenamento conectado e testado." }); }} />}
+      {editingStorage && <StorageWizard destination={editingStorage} onClose={() => setEditingStorage(null)} onDone={async () => { setEditingStorage(null); await refresh(); showNotice({ tone: "success", text: "Armazenamento atualizado." }); }} />}
       {selectedRunId && <RunDetailModal runId={selectedRunId} onClose={() => setSelectedRunId("")} />}
     </AppShell>
   );
@@ -319,8 +325,9 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onToggle, 
   );
 }
 
-function StoragePage({ data, refresh, openCreate, showNotice }: { data: AppData; refresh: () => Promise<void>; openCreate: () => void; showNotice: (notice: Notice) => void }) {
+function StoragePage({ data, refresh, openCreate, openEdit, showNotice }: { data: AppData; refresh: () => Promise<void>; openCreate: () => void; openEdit: (destination: Destination) => void; showNotice: (notice: Notice) => void }) {
   const [busy, setBusy] = useState("");
+  const dependencyCount = (id: string) => data.policies.filter((item) => item.destinationId === id).length + data.runs.filter((item) => item.destinationId === id).length;
   const testDestination = async (id: string) => {
     setBusy(id);
     try {
@@ -333,10 +340,24 @@ function StoragePage({ data, refresh, openCreate, showNotice }: { data: AppData;
       setBusy("");
     }
   };
-  const deleteDestination = async (id: string) => {
-    setBusy(id);
+  const archiveDestination = async (destination: Destination) => {
+    setBusy(destination.id);
     try {
-      await api(`/destinations/${id}`, { method: "DELETE" });
+      const path = destination.status === "archived" ? "reactivate" : "archive";
+      await api(`/destinations/${destination.id}/${path}`, { method: "POST", body: "{}" });
+      await refresh();
+      showNotice({ tone: "success", text: destination.status === "archived" ? "Armazenamento reativado. Teste antes de usar." : "Armazenamento arquivado e rotinas vinculadas pausadas." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+  const deleteDestination = async (destination: Destination) => {
+    if (dependencyCount(destination.id) > 0) return archiveDestination(destination);
+    setBusy(destination.id);
+    try {
+      await api(`/destinations/${destination.id}`, { method: "DELETE" });
       await refresh();
       showNotice({ tone: "success", text: "Armazenamento removido." });
     } catch (err: any) {
@@ -347,9 +368,9 @@ function StoragePage({ data, refresh, openCreate, showNotice }: { data: AppData;
   };
   return (
     <>
-      <PageTitle eyebrow="Storage" title="Onde salvar" text="Conexoes Microsoft usadas pelos backups. Segredos da aplicacao ficam no ambiente do servidor." action={<button className="primaryButton" onClick={openCreate}><Plus size={15} /> Conectar</button>} />
+      <PageTitle eyebrow="Storage" title="Onde salvar" text="Conexoes Microsoft usadas pelos backups. Escolha site, biblioteca e pasta sem digitar IDs." action={<button className="primaryButton" onClick={openCreate}><Plus size={15} /> Conectar</button>} />
       <section className="sectionBlock">
-        <StorageList destinations={data.destinations} onTest={testDestination} onDelete={deleteDestination} busy={busy} />
+        <StorageList destinations={data.destinations} dependencyCount={dependencyCount} onTest={testDestination} onEdit={openEdit} onArchive={archiveDestination} onDelete={deleteDestination} busy={busy} />
       </section>
     </>
   );
@@ -398,26 +419,76 @@ function RestorePage({ data, onRunOpen, showNotice }: { data: AppData; onRunOpen
   );
 }
 
-function SettingsPage({ user, onLogout }: { user: any; onLogout: () => void }) {
-  const [status, setStatus] = useState<any>(null);
+function SettingsPage({ user, onLogout, showNotice }: { user: any; onLogout: () => void; showNotice: (notice: Notice) => void }) {
+  const [msConfig, setMsConfig] = useState<any>(null);
+  const [tenantId, setTenantId] = useState("");
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
   const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState("");
   useEffect(() => {
-    api("/integrations/microsoft/status").then(setStatus).finally(() => setLoading(false));
+    api("/integrations/microsoft/config").then((config) => {
+      setMsConfig(config);
+      setTenantId(config.tenantId ?? "");
+      setClientId(config.clientId ?? "");
+    }).finally(() => setLoading(false));
   }, []);
+  const save = async () => {
+    setBusy("save");
+    try {
+      const payload: any = { tenantId, clientId };
+      if (clientSecret) payload.clientSecret = clientSecret;
+      const saved = await api("/integrations/microsoft/config", { method: "PUT", body: JSON.stringify(payload) });
+      setMsConfig(saved);
+      setClientSecret("");
+      showNotice({ tone: "success", text: "Integração Microsoft salva." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+  const test = async () => {
+    setBusy("test");
+    try {
+      const result = await api("/integrations/microsoft/test", { method: "POST", body: "{}" });
+      setMsConfig(result.config);
+      showNotice({ tone: "success", text: "Microsoft Graph conectado." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
   return (
     <>
       <PageTitle eyebrow="Settings" title="Configuracoes" text="Estado da instalacao self-hosted, sessao e integracoes operacionais." action={<button className="secondaryButton" onClick={onLogout}><LogOut size={15} /> Sair</button>} />
       <section className="settingsGrid">
         <InfoCard title="Conta" rows={[["Usuario", user.email], ["Perfil", user.role]]} />
-        <InfoCard title="Microsoft" rows={loading ? [["Status", "carregando"]] : [["Status", status?.ok ? "conectado" : "falhou"], ["Token", status?.tokenPresent ? "presente" : "ausente"], ["Tipo", status?.tokenType ?? "nao informado"]]} />
-        <InfoCard title="Operacao" rows={[["Ambiente", "self-hosted"], ["Segredos", "variaveis do servidor"], ["Interface", "sem expor credenciais sensiveis"]]} />
+        <InfoCard title="Operacao" rows={[["Ambiente", "self-hosted"], ["Segredos", "criptografados localmente"], ["Interface", "sem expor secret salvo"]]} />
+      </section>
+      <section className="sectionBlock settingsPanel">
+        <SectionHeader title="Integracao Microsoft" action={<StatusBadge status={msConfig?.status ?? "untested"} />} />
+        <div className="formGrid">
+          <Field label="Tenant ID"><input value={tenantId} onChange={(e) => setTenantId(e.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" /></Field>
+          <Field label="Client ID"><input value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="Application client id" /></Field>
+          <Field label={msConfig?.clientSecretSet ? "Client Secret novo opcional" : "Client Secret"}><input type="password" value={clientSecret} onChange={(e) => setClientSecret(e.target.value)} placeholder={msConfig?.clientSecretSet ? "secret salvo; preencha para trocar" : "cole o secret uma vez"} /></Field>
+        </div>
+        <div className="settingsHint">
+          {loading ? "Carregando configuracao..." : msConfig?.clientSecretSet ? `Secret salvo. Ultimo teste: ${msConfig.lastTestedAt ? formatDate(msConfig.lastTestedAt) : "ainda nao testado"}.` : "Configure as credenciais do App Microsoft para listar sites, bibliotecas e salvar backups."}
+        </div>
+        <div className="footerActions">
+          <button className="secondaryButton" disabled={busy === "test" || !tenantId || !clientId} onClick={test}>{busy === "test" ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />} Testar conexao</button>
+          <button className="primaryButton" disabled={busy === "save" || !tenantId || !clientId || (!clientSecret && !msConfig?.clientSecretSet)} onClick={save}>{busy === "save" ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Salvar</button>
+        </div>
       </section>
     </>
   );
 }
 
-function NewBackupWizard({ data, onClose, onDone }: { data: AppData; onClose: () => void; onDone: (runId?: string) => void }) {
-  const preferredDestination = data.destinations.find((destination) => destination.status === "healthy") ?? data.destinations[0];
+function NewBackupWizard({ data, onCreateStorage, onClose, onDone }: { data: AppData; onCreateStorage: () => void; onClose: () => void; onDone: (runId?: string) => void }) {
+  const healthyDestinations = data.destinations.filter((destination) => destination.status === "healthy");
+  const preferredDestination = healthyDestinations[0];
   const [step, setStep] = useState(1);
   const [sourceType, setSourceType] = useState<SourceType>("postgres");
   const [destinationType, setDestinationType] = useState<DestinationType>("sharepoint");
@@ -425,8 +496,6 @@ function NewBackupWizard({ data, onClose, onDone }: { data: AppData; onClose: ()
   const [selectedSourceId, setSelectedSourceId] = useState(data.sources.find((source) => source.type === "postgres")?.id ?? "");
   const [selectedDestinationId, setSelectedDestinationId] = useState(preferredDestination?.id ?? "");
   const [sourceName, setSourceName] = useState("Production PostgreSQL");
-  const [destinationName, setDestinationName] = useState("SharePoint Backups");
-  const [driveTarget, setDriveTarget] = useState("");
   const [routineName, setRoutineName] = useState("Backup diario");
   const [keepLast, setKeepLast] = useState(7);
   const [keepDays, setKeepDays] = useState(30);
@@ -446,12 +515,7 @@ function NewBackupWizard({ data, onClose, onDone }: { data: AppData; onClose: ()
         sourceId = source.source.id;
       }
       let destinationId = selectedDestinationId;
-      if (!destinationId) {
-        if (!driveTarget) throw new Error("Escolha um armazenamento existente ou informe um driveId/usuario.");
-        const destinationConfig = driveTarget.includes("@") ? { mode: "graph", userPrincipalName: driveTarget } : { mode: "graph", driveId: driveTarget };
-        const destination = await api("/destinations", { method: "POST", body: JSON.stringify({ name: destinationName, type: destinationType, basePath: "/SnapVault", config: destinationConfig }) });
-        destinationId = destination.destination.id;
-      }
+      if (!destinationId) throw new Error("Conecte e teste um armazenamento antes de criar a rotina.");
       const schedule = frequency === "manual" ? { type: "daily", time: "02:00", timezone: "America/Sao_Paulo" } : { type: frequency, time: "02:00", timezone: "America/Sao_Paulo" };
       const policy = await api("/policies", { method: "POST", body: JSON.stringify({ name: routineName, sourceId, destinationId, schedule, retention: { keepLast, keepDays }, options: { compression: "gzip", encryption: false, verifyAfterUpload: true }, enabled: true }) });
       const run = await api(`/policies/${policy.policy.id}/run`, { method: "POST", body: "{}" });
@@ -482,15 +546,12 @@ function NewBackupWizard({ data, onClose, onDone }: { data: AppData; onClose: ()
         )}
         {step === 2 && (
           <ChoiceGrid>
-            {data.destinations.length > 0 && <div className="choiceSectionTitle">Usar armazenamento existente</div>}
-            {[...data.destinations].sort((a, b) => Number(b.status === "healthy") - Number(a.status === "healthy")).map((destination) => (
+            {healthyDestinations.length > 0 && <div className="choiceSectionTitle">Armazenamentos prontos</div>}
+            {healthyDestinations.map((destination) => (
               <Choice key={destination.id} active={selectedDestinationId === destination.id} icon={<Cloud size={18} />} title={destination.name} text={`${destination.type} em ${destination.basePath}`} onClick={() => { setSelectedDestinationId(destination.id); setDestinationType(destination.type === "onedrive" ? "onedrive" : "sharepoint"); }} />
             ))}
-            <div className="choiceSectionTitle">Ou criar novo armazenamento</div>
-            <Choice active={!selectedDestinationId && destinationType === "sharepoint"} icon={<Cloud size={18} />} title="SharePoint" text="Salvar em um drive de site Microsoft." onClick={() => { setSelectedDestinationId(""); setDestinationType("sharepoint"); setDestinationName("SharePoint Backups"); }} />
-            <Choice active={!selectedDestinationId && destinationType === "onedrive"} icon={<Cloud size={18} />} title="OneDrive" text="Salvar no drive de um usuario Microsoft." onClick={() => { setSelectedDestinationId(""); setDestinationType("onedrive"); setDestinationName("OneDrive Backups"); }} />
-            {!selectedDestinationId && <Field label="Nome do armazenamento"><input value={destinationName} onChange={(e) => setDestinationName(e.target.value)} /></Field>}
-            {!selectedDestinationId && <Field label="Drive ou usuario"><input value={driveTarget} onChange={(e) => setDriveTarget(e.target.value)} placeholder="driveId ou usuario@empresa.com" /></Field>}
+            {!healthyDestinations.length && <EmptyState compact title="Nenhum armazenamento pronto" text="Conecte SharePoint ou OneDrive, escolha a biblioteca e rode o teste de permissao." />}
+            <button className="secondaryButton full" onClick={onCreateStorage}><Plus size={15} /> Conectar armazenamento</button>
           </ChoiceGrid>
         )}
         {step === 3 && (
@@ -524,39 +585,96 @@ function NewBackupWizard({ data, onClose, onDone }: { data: AppData; onClose: ()
   );
 }
 
-function ConnectStorageModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-  const [type, setType] = useState<DestinationType>("sharepoint");
-  const [name, setName] = useState("SharePoint Backups");
-  const [target, setTarget] = useState("");
-  const [basePath, setBasePath] = useState("/SnapVault");
-  const [busy, setBusy] = useState(false);
+function StorageWizard({ destination, onClose, onDone }: { destination?: Destination; onClose: () => void; onDone: () => void }) {
+  const editing = Boolean(destination);
+  const [type, setType] = useState<DestinationType>((destination?.type === "onedrive" ? "onedrive" : "sharepoint"));
+  const [name, setName] = useState(destination?.name ?? "SharePoint Backups");
+  const [basePath, setBasePath] = useState(destination?.basePath ?? "/SnapVault");
+  const [sites, setSites] = useState<MicrosoftSite[]>([]);
+  const [drives, setDrives] = useState<MicrosoftDrive[]>([]);
+  const [users, setUsers] = useState<MicrosoftUser[]>([]);
+  const [siteId, setSiteId] = useState(String(destination?.config?.siteId ?? ""));
+  const [driveId, setDriveId] = useState(String(destination?.config?.driveId ?? ""));
+  const [userPrincipalName, setUserPrincipalName] = useState(String(destination?.config?.userPrincipalName ?? ""));
+  const [advanced, setAdvanced] = useState(false);
+  const [testResult, setTestResult] = useState<any>(destination?.metadata ?? null);
+  const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
-  const save = async () => {
-    setBusy(true);
+
+  useEffect(() => {
+    api("/integrations/microsoft/sites").then((r) => setSites(r.sites ?? [])).catch((err) => setError(readableGraphError(err.message)));
+    api("/integrations/microsoft/users").then((r) => setUsers(r.users ?? [])).catch(() => setUsers([]));
+  }, []);
+  useEffect(() => {
+    if (!siteId || type !== "sharepoint") return;
+    api(`/integrations/microsoft/site-drives?siteId=${encodeURIComponent(siteId)}`).then((r) => setDrives(r.drives ?? [])).catch((err) => setError(readableGraphError(err.message)));
+  }, [siteId, type]);
+
+  const selectedSite = sites.find((item) => item.id === siteId);
+  const selectedDrive = drives.find((item) => item.id === driveId);
+  const selectedUser = users.find((item) => item.userPrincipalName === userPrincipalName);
+
+  const buildConfig = () => {
+    if (advanced) return { mode: "graph", driveId };
+    if (type === "onedrive") return { mode: "graph", userPrincipalName, driveId, userName: selectedUser?.displayName ?? userPrincipalName };
+    return { mode: "graph", siteId, siteName: selectedSite?.displayName ?? selectedSite?.name ?? siteId, driveId, driveName: selectedDrive?.name ?? driveId };
+  };
+  const canTest = advanced ? Boolean(driveId) : type === "onedrive" ? Boolean(userPrincipalName || driveId) : Boolean(siteId && driveId);
+
+  const test = async () => {
+    setBusy("test");
     setError("");
     try {
-      const config = target.includes("@") ? { mode: "graph", userPrincipalName: target } : { mode: "graph", driveId: target };
-      await api("/destinations", { method: "POST", body: JSON.stringify({ name, type, basePath, config }) });
+      let probeId = destination?.id;
+      if (!probeId) {
+        const created = await api("/destinations", { method: "POST", body: JSON.stringify({ name, type, basePath, config: buildConfig(), metadata: { site: selectedSite, drive: selectedDrive, user: selectedUser } }) });
+        probeId = created.destination.id;
+      } else {
+        await api(`/destinations/${probeId}`, { method: "PATCH", body: JSON.stringify({ name, basePath, config: buildConfig(), metadata: { site: selectedSite, drive: selectedDrive, user: selectedUser } }) });
+      }
+      const result = await api(`/destinations/${probeId}/test`, { method: "POST", body: "{}" });
+      setTestResult(result);
       onDone();
     } catch (err: any) {
-      setError(err.message);
+      setError(readableGraphError(err.message));
     } finally {
-      setBusy(false);
+      setBusy("");
     }
   };
+
+  const saveOnly = async () => {
+    setBusy("save");
+    setError("");
+    try {
+      const payload = { name, type, basePath, config: buildConfig(), metadata: { site: selectedSite, drive: selectedDrive, user: selectedUser } };
+      if (destination) await api(`/destinations/${destination.id}`, { method: "PATCH", body: JSON.stringify(payload) });
+      else await api("/destinations", { method: "POST", body: JSON.stringify(payload) });
+      onDone();
+    } catch (err: any) {
+      setError(readableGraphError(err.message));
+    } finally {
+      setBusy("");
+    }
+  };
+
   return (
-    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Conectar armazenamento">
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label={editing ? "Editar armazenamento" : "Conectar armazenamento"}>
       <div className="wizard compactWizard">
-        <header className="wizardHeader"><div><span>Storage</span><h2>Conectar armazenamento</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
+        <header className="wizardHeader"><div><span>Storage</span><h2>{editing ? "Editar armazenamento" : "Conectar armazenamento"}</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
         <ChoiceGrid>
-          <Choice active={type === "sharepoint"} icon={<Cloud size={18} />} title="SharePoint" text="Drive de um site Microsoft." onClick={() => { setType("sharepoint"); setName("SharePoint Backups"); }} />
-          <Choice active={type === "onedrive"} icon={<Cloud size={18} />} title="OneDrive" text="Drive de um usuario Microsoft." onClick={() => { setType("onedrive"); setName("OneDrive Backups"); }} />
+          <Choice active={type === "sharepoint"} icon={<Cloud size={18} />} title="SharePoint" text="Escolha site, biblioteca e pasta." onClick={() => { setType("sharepoint"); setName("SharePoint Backups"); }} />
+          <Choice active={type === "onedrive"} icon={<Cloud size={18} />} title="OneDrive" text="Escolha o usuario e a pasta." onClick={() => { setType("onedrive"); setName("OneDrive Backups"); }} />
           <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} /></Field>
-          <Field label="Drive ID ou usuario"><input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="driveId ou usuario@empresa.com" /></Field>
-          <Field label="Pasta base"><input value={basePath} onChange={(e) => setBasePath(e.target.value)} /></Field>
+          {!advanced && type === "sharepoint" && <Field label="Site SharePoint"><select value={siteId} onChange={(e) => { setSiteId(e.target.value); setDriveId(""); }}><option value="">Escolha um site</option>{sites.map((site) => <option key={site.id} value={site.id}>{site.displayName || site.name || site.webUrl || site.id}</option>)}</select></Field>}
+          {!advanced && type === "sharepoint" && <Field label="Biblioteca de documentos"><select value={driveId} onChange={(e) => setDriveId(e.target.value)} disabled={!siteId}><option value="">Escolha uma biblioteca</option>{drives.map((drive) => <option key={drive.id} value={drive.id}>{drive.name}</option>)}</select></Field>}
+          {!advanced && type === "onedrive" && <Field label="Usuario"><select value={userPrincipalName} onChange={(e) => setUserPrincipalName(e.target.value)}><option value="">Escolha um usuario</option>{users.map((user) => <option key={user.id} value={user.userPrincipalName}>{user.displayName || user.mail || user.userPrincipalName}</option>)}</select></Field>}
+          <Field label="Pasta base"><input value={basePath} onChange={(e) => setBasePath(e.target.value)} placeholder="/SnapVault" /></Field>
+          <button className="linkButton" onClick={() => setAdvanced(!advanced)}>{advanced ? "Usar fluxo guiado" : "Modo avancado"}</button>
+          {advanced && <Field label="Drive ID"><input value={driveId} onChange={(e) => setDriveId(e.target.value)} placeholder="cole o driveId somente se souber o destino exato" /></Field>}
+          {testResult?.quota && <div className="quotaBox"><strong>Espaco do drive</strong><span>{formatBytes(testResult.quota.used)} usados de {formatBytes(testResult.quota.total)} · {formatBytes(testResult.quota.remaining)} livres</span></div>}
         </ChoiceGrid>
         {error && <p className="formError">{error}</p>}
-        <footer className="wizardFooter"><button className="secondaryButton" onClick={onClose}>Cancelar</button><button className="primaryButton" disabled={busy || !target} onClick={save}>{busy ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Conectar</button></footer>
+        <footer className="wizardFooter"><button className="secondaryButton" onClick={onClose}>Cancelar</button><div className="footerActions inline"><button className="secondaryButton" disabled={busy === "save" || !canTest} onClick={saveOnly}>{busy === "save" ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Salvar sem testar</button><button className="primaryButton" disabled={busy === "test" || !canTest} onClick={test}>{busy === "test" ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />} Testar e salvar</button></div></footer>
       </div>
     </div>
   );
@@ -660,9 +778,29 @@ function BackupList({ data, onRun, onPolicyOpen, busy, limit, onToggle, onDelete
   );
 }
 
-function StorageList({ destinations, onTest, onDelete, busy }: { destinations: Destination[]; onTest: (id: string) => void; onDelete: (id: string) => void; busy: string }) {
+function StorageList({ destinations, dependencyCount, onTest, onEdit, onArchive, onDelete, busy }: { destinations: Destination[]; dependencyCount: (id: string) => number; onTest: (id: string) => void; onEdit: (destination: Destination) => void; onArchive: (destination: Destination) => void; onDelete: (destination: Destination) => void; busy: string }) {
   if (!destinations.length) return <EmptyState title="Nenhum armazenamento" text="Conecte SharePoint ou OneDrive para salvar seus backups." />;
-  return <div className="itemList">{destinations.map((destination) => <article className="listItem" key={destination.id}><div className="itemMain"><strong>{destination.name}</strong><span>{destination.type} em {destination.basePath}</span></div><StatusBadge status={destination.status} /><div className="rowActions"><button className="secondaryButton small" disabled={busy === destination.id} onClick={() => onTest(destination.id)}>{busy === destination.id ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} Testar</button><button className="iconOnly danger" disabled={busy === destination.id} onClick={() => onDelete(destination.id)} aria-label="Remover armazenamento"><Trash2 size={15} /></button></div></article>)}</div>;
+  return <div className="itemList">{destinations.map((destination) => {
+    const deps = dependencyCount(destination.id);
+    const quota = destination.metadata?.quota;
+    const place = destination.config?.siteName || destination.config?.userName || destination.config?.userPrincipalName || destination.type;
+    const library = destination.config?.driveName ? ` · ${destination.config.driveName}` : "";
+    return (
+      <article className="listItem storageItem" key={destination.id}>
+        <div className="itemMain">
+          <strong>{destination.name}</strong>
+          <span>{place}{library} · {destination.basePath}</span>
+          {quota && <span>{formatBytes(quota.used)} usados · {formatBytes(quota.remaining)} livres</span>}
+        </div>
+        <StatusBadge status={destination.status} />
+        <div className="rowActions">
+          <button className="secondaryButton small" disabled={busy === destination.id || destination.status === "archived"} onClick={() => onTest(destination.id)}>{busy === destination.id ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} Testar</button>
+          <button className="secondaryButton small" disabled={busy === destination.id} onClick={() => onEdit(destination)}><Pencil size={14} /> Editar</button>
+          <button className="secondaryButton small" disabled={busy === destination.id} onClick={() => destination.status === "archived" ? onArchive(destination) : deps > 0 ? onArchive(destination) : onDelete(destination)}>{destination.status === "archived" ? <RefreshCw size={14} /> : <Trash2 size={14} />} {destination.status === "archived" ? "Reativar" : deps > 0 ? "Arquivar" : "Excluir"}</button>
+        </div>
+      </article>
+    );
+  })}</div>;
 }
 
 function RecentRuns({ runs, onOpen }: { runs: Run[]; onOpen: (id: string) => void }) {
@@ -723,7 +861,7 @@ function stepTitle(step: number) {
 }
 
 function statusLabel(status: string) {
-  return status === "success" ? "enviado" : status === "verified" ? "verificado" : status === "recoverable" ? "restore testado" : status === "restore_failed" ? "restore falhou" : status === "failed" ? "falhou" : status === "healthy" ? "conectado" : status === "ready" ? "pronto" : status === "untested" ? "nao testado" : status === "paused" ? "pausado" : status;
+  return status === "success" ? "enviado" : status === "verified" ? "verificado" : status === "recoverable" ? "restore testado" : status === "restore_failed" ? "restore falhou" : status === "failed" ? "falhou" : status === "healthy" ? "conectado" : status === "ready" ? "pronto" : status === "untested" ? "nao testado" : status === "paused" ? "pausado" : status === "archived" ? "arquivado" : status;
 }
 
 function verificationLabel(run: Run) {
@@ -755,6 +893,14 @@ function formatBytes(value: number | null) {
 
 function formatDate(value: string) {
   return new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "short" }).format(new Date(value));
+}
+
+function readableGraphError(message: string) {
+  if (message.includes("Microsoft credentials are not configured")) return "Configure Tenant ID, Client ID e Client Secret em Settings antes de conectar Storage.";
+  if (message.includes("403") || message.toLowerCase().includes("proibido")) return "Permissao insuficiente no Microsoft Graph para esse site ou biblioteca.";
+  if (message.includes("404")) return "Site, biblioteca ou pasta nao encontrada pelo Microsoft Graph.";
+  if (message.toLowerCase().includes("delete")) return "O teste criou e leu o arquivo, mas nao conseguiu excluir. Revise permissoes de escrita/exclusao.";
+  return message;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

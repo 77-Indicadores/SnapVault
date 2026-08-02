@@ -22,6 +22,16 @@ SNAPVAULT_RCLONE_CONFIG=/config/rclone/rclone.conf
 SNAPVAULT_MAX_CONCURRENT_JOBS=2
 ```
 
+`SNAPVAULT_SECRET_KEY` e obrigatoria em producao. Ela criptografa segredos persistidos localmente, incluindo o `Client Secret` Microsoft cadastrado pela interface.
+
+As variaveis abaixo sao opcionais e servem para bootstrap/dev. Em uso normal, configure pela tela `Settings > Integracao Microsoft`.
+
+```env
+MS_CLIENT_ID=
+MS_CLIENT_SECRET=
+MS_TENANT_ID=
+```
+
 ## Volumes
 
 ```txt
@@ -39,6 +49,25 @@ MVP precisa dos binarios:
 - `rclone`
 
 As imagens Docker oficiais do SnapVault devem incluir esses binarios ou validar claramente sua ausencia.
+
+## Microsoft SharePoint / OneDrive
+
+O admin configura `Tenant ID`, `Client ID` e `Client Secret` na interface. Depois disso, a tela `Storage` lista:
+
+- sites SharePoint disponiveis;
+- bibliotecas de documentos do site escolhido;
+- usuarios para OneDrive quando a permissao do Graph permitir;
+- quota total, usada e livre do drive.
+
+O usuario nao deve digitar biblioteca manualmente no fluxo normal. O caminho final e:
+
+```txt
+Tenant Microsoft -> Site SharePoint -> Biblioteca -> Pasta base
+```
+
+Antes de ficar `healthy`, o Storage precisa passar por teste real de permissao: criar arquivo temporario, baixar, validar checksum, excluir e consultar quota.
+
+Storages com rotinas, runs ou artefatos vinculados devem ser arquivados, nao apagados. O arquivamento remove o Storage da criacao de novas rotinas, pausa rotinas vinculadas e preserva historico/restore.
 
 ## Backup do proprio SnapVault
 

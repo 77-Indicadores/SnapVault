@@ -1,7 +1,7 @@
 export type Role = "admin" | "operator" | "viewer";
 export type SourceType = "postgres" | "minio";
 export type DestinationType = "onedrive" | "sharepoint" | "s3" | "azure_blob" | "google_drive" | "dropbox" | "b2" | "wasabi" | "ftp" | "sftp";
-export type ResourceStatus = "untested" | "healthy" | "failed";
+export type ResourceStatus = "untested" | "healthy" | "failed" | "archived";
 export type RunStatus = "queued" | "running" | "success" | "verified" | "recoverable" | "restore_failed" | "failed" | "cancelled";
 
 export type User = {
@@ -42,8 +42,20 @@ export type Destination = {
   basePath: string;
   status: ResourceStatus;
   lastTestedAt: string | null;
+  metadata?: Record<string, unknown>;
+  archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
+};
+
+export type MicrosoftIntegration = {
+  tenantId: string;
+  clientId: string;
+  encryptedClientSecret: string;
+  createdAt: string;
+  updatedAt: string;
+  lastTestedAt: string | null;
+  status: ResourceStatus;
 };
 
 export type Policy = {
@@ -117,6 +129,9 @@ export type JobLogEntry = {
 };
 
 export type Database = {
+  settings?: {
+    microsoft?: MicrosoftIntegration | null;
+  };
   users: User[];
   sessions: Session[];
   sources: Source[];
