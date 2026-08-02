@@ -25,7 +25,7 @@ export async function verifyRestoreForRun(store: Store, runId: string, stagingRo
   await mkdir(verifyDir, { recursive: true });
 
   try {
-    const localArtifact = await downloadArtifact(destination, artifact, verifyDir, log, await getMicrosoftCredentials(store));
+    const localArtifact = await downloadArtifact(destination, artifact, verifyDir, log, await getMicrosoftCredentials(store, String(destination.config.microsoftIntegrationId ?? "")));
     await verifyChecksum(localArtifact, artifact, log);
     const checkedArtifacts = source.type === "postgres"
       ? await verifyPostgresRestore(source, runId, localArtifact, log)
@@ -87,9 +87,11 @@ async function downloadArtifact(destination: Destination, artifact: BackupArtifa
   throw new Error("Restore verification requires Microsoft Graph or a local artifact path");
 }
 
-async function getMicrosoftCredentials(store: Store) {
+async function getMicrosoftCredentials(store: Store, integrationId?: string) {
   const db = await store.read();
-  const saved = db.settings?.microsoft;
+  const saved = integrationId
+    ? db.microsoftIntegrations?.find((item: any) => item.id === integrationId) ?? db.settings?.microsoft
+    : db.settings?.microsoft ?? db.microsoftIntegrations?.[0];
   if (saved?.tenantId && saved?.clientId && saved?.encryptedClientSecret) {
     return { tenantId: saved.tenantId, clientId: saved.clientId, clientSecret: decryptText(saved.encryptedClientSecret, config.cookieSecret) };
   }

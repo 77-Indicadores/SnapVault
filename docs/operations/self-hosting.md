@@ -52,7 +52,7 @@ As imagens Docker oficiais do SnapVault devem incluir esses binarios ou validar 
 
 ## Microsoft SharePoint / OneDrive
 
-O admin configura `Tenant ID`, `Client ID` e `Client Secret` na interface. Depois disso, a tela `Storage` lista:
+O admin pode configurar uma ou mais integracoes Microsoft na interface. Cada integracao possui `Tenant ID`, `Client ID` e `Client Secret` proprios. Depois disso, a tela `Storage` escolhe qual integracao usar e lista:
 
 - sites SharePoint disponiveis;
 - bibliotecas de documentos do site escolhido;
@@ -68,6 +68,57 @@ Tenant Microsoft -> Site SharePoint -> Biblioteca -> Pasta base
 Antes de ficar `healthy`, o Storage precisa passar por teste real de permissao: criar arquivo temporario, baixar, validar checksum, excluir e consultar quota.
 
 Storages com rotinas, runs ou artefatos vinculados devem ser arquivados, nao apagados. O arquivamento remove o Storage da criacao de novas rotinas, pausa rotinas vinculadas e preserva historico/restore.
+
+## Origens
+
+PostgreSQL e MinIO devem ser cadastrados em `Sources` antes de criar rotinas.
+
+PostgreSQL:
+
+- host;
+- porta;
+- usuario;
+- senha criptografada;
+- escopo: um database ou todos os databases acessiveis;
+- teste lista os databases disponiveis.
+
+MinIO:
+
+- endpoint;
+- access key;
+- secret key criptografada;
+- escopo: um bucket ou todos os buckets acessiveis;
+- prefixo opcional;
+- teste lista os buckets disponiveis.
+
+O wizard de backup deve apenas combinar `Source healthy` com `Storage healthy`. Ele nao cria conexoes escondidas.
+
+Sources com rotinas, runs ou artefatos vinculados devem ser arquivadas, nao apagadas. Arquivar uma Source pausa rotinas vinculadas e preserva historico/restore. Reativar volta como `untested`, exigindo novo teste.
+
+## Agendamento
+
+Rotinas podem ser:
+
+- `manual`: nunca rodam sozinhas;
+- `daily`: rodam uma vez por dia no horario definido;
+- `weekly`: rodam no dia da semana e horario definidos.
+
+No MVP, o scheduler roda dentro da API e compara horario em UTC. Em producao, configure o horario pensando no UTC ate o suporte completo a timezones nomeados entrar.
+
+## Restore
+
+Depois de cada backup verificado, o SnapVault tenta baixar o artefato do destino, validar checksum e executar restore temporario. Apenas runs com esse teste aprovado ficam `recoverable`.
+
+O restore manual pela interface exige escolher uma Source alvo `healthy` do mesmo tipo:
+
+- PostgreSQL: alvo com um database unico;
+- MinIO: alvo com um bucket unico.
+
+Essa restricao evita restaurar acidentalmente um backup amplo sobre um ambiente errado.
+
+## Migracao local
+
+Instalacoes antigas que tinham `settings.microsoft` singleton sao migradas automaticamente para `microsoftIntegrations[]` na leitura do banco local. Destinos Microsoft antigos passam a apontar para a primeira integracao migrada. Sources antigas com runs `recoverable` sao preservadas como saudaveis para nao bloquear rotinas ja validadas.
 
 ## Backup do proprio SnapVault
 

@@ -48,7 +48,7 @@ export async function executeBackupRun(store: Store, runId: string, stagingRoot:
     const produced = await createSourceArtifact(source, policy, runDir, log);
     await verifyLocalArtifacts(source, produced, log);
     const manifestPath = await writeManifest(run, source, policy, produced, runDir);
-    const uploaded = await uploadArtifacts(destination, source, run, [...produced, manifestPath], log, getMicrosoftCredentials(db));
+    const uploaded = await uploadArtifacts(destination, source, run, [...produced, manifestPath], log, getMicrosoftCredentials(db, String(destination.config.microsoftIntegrationId ?? "")));
     const finishedAt = now();
     const totalBytes = uploaded.reduce((sum, item) => sum + (item.sizeBytes ?? 0), 0);
     await store.update((next) => {
@@ -82,7 +82,7 @@ async function applyRetention(store: Store, policy: Policy, destination: Destina
     return;
   }
   const db = await store.read();
-  const microsoftCredentials = getMicrosoftCredentials(db);
+  const microsoftCredentials = getMicrosoftCredentials(db, String(destination.config.microsoftIntegrationId ?? ""));
   const keepLast = Math.max(1, policy.retention.keepLast);
   const keepDays = Math.max(0, policy.retention.keepDays);
   const policyRuns = db.runs
@@ -169,6 +169,13 @@ async function createPostgresDump(source: Source, policy: Policy, runDir: string
     return [out];
   }
   const config = source.config as any;
+  if (config.scope === "all") {
+    const result = await runCommand("pg_dumpall", ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username)], { PGPASSWORD: source.secrets.password ?? "" });
+    if (result.code !== 0) throw new Error(result.stderr || "pg_dumpall failed");
+    if (policy.options.compression === "gzip") await pipeline(Readable.from([result.stdout]), createGzip(), createWriteStream(out));
+    else await writeFile(out, result.stdout);
+    return [out];
+  }
   const args = ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username), String(config.database)];
   const result = await runCommand("pg_dump", args, { PGPASSWORD: source.secrets.password ?? "" });
   if (result.code !== 0) throw new Error(result.stderr || "pg_dump failed");
@@ -194,7 +201,7 @@ async function createMinioSnapshot(source: Source, policy: Policy, runDir: strin
   await mkdir(objectDir, { recursive: true });
   const aliasResult = await runCommand("mc", ["alias", "set", alias, String(config.endpoint), source.secrets.accessKey ?? "", source.secrets.secretKey ?? ""]);
   if (aliasResult.code !== 0) throw new Error(aliasResult.stderr || "mc alias set failed");
-  const bucketPath = [String(config.bucket), String(config.prefix ?? "").replace(/^\/+|\/+$/g, "")].filter(Boolean).join("/");
+  const bucketPath = config.scope === "all" ? "" : [String(config.bucket), String(config.prefix ?? "").replace(/^\/+|\/+$/g, "")].filter(Boolean).join("/");
   const copyResult = await runCommand("mc", ["cp", "--recursive", `${alias}/${bucketPath}`, objectDir]);
   await runCommand("mc", ["alias", "remove", alias]);
   if (copyResult.code !== 0) throw new Error(copyResult.stderr || "mc copy failed");
@@ -258,8 +265,10 @@ async function uploadArtifacts(destination: Destination, source: Source, run: Ba
   return records;
 }
 
-function getMicrosoftCredentials(db: any) {
-  const saved = db.settings?.microsoft;
+function getMicrosoftCredentials(db: any, integrationId?: string) {
+  const saved = integrationId
+    ? db.microsoftIntegrations?.find((item: any) => item.id === integrationId) ?? db.settings?.microsoft
+    : db.settings?.microsoft ?? db.microsoftIntegrations?.[0];
   if (saved?.tenantId && saved?.clientId && saved?.encryptedClientSecret) {
     return { tenantId: saved.tenantId, clientId: saved.clientId, clientSecret: decryptText(saved.encryptedClientSecret, config.cookieSecret) };
   }

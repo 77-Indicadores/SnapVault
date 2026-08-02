@@ -11,6 +11,10 @@ MVP funcional em Docker:
 - Frontend React/Vite em `apps/web`.
 - API Fastify em `apps/api`.
 - Onboarding no primeiro acesso com criacao do administrador.
+- Cadastro real de origens PostgreSQL e MinIO pela interface.
+- Listagem assistida de databases PostgreSQL e buckets MinIO.
+- Escopo por origem: um database/bucket especifico ou todos os acessiveis.
+- Multiplas integracoes Microsoft, cada uma com tenant/app/secret proprios.
 - Backup real de PostgreSQL via `pg_dump`.
 - Backup real de MinIO via `mc`.
 - Upload para SharePoint/OneDrive via Microsoft Graph.
@@ -54,16 +58,17 @@ No primeiro acesso, crie o usuario administrador.
 ## Como funciona
 
 1. Voce cria uma rotina de backup.
-2. Voce escolhe um Storage ja testado.
-3. Para SharePoint, o SnapVault lista sites e bibliotecas pelo Microsoft Graph.
-4. O SnapVault gera o dump/snapshot.
-5. O arquivo e validado localmente.
-6. O arquivo e enviado para Microsoft Graph.
-7. O SnapVault baixa o artefato remoto.
-8. O checksum remoto e conferido.
-9. Um restore temporario e executado.
-10. Se tudo passar, a execucao vira `recoverable`.
-11. A politica de retencao remove backups antigos preservando o minimo configurado.
+2. Voce escolhe uma origem ja testada.
+3. Voce escolhe um Storage ja testado.
+4. Para SharePoint, o SnapVault lista sites e bibliotecas pelo Microsoft Graph da integracao escolhida.
+5. O SnapVault gera o dump/snapshot.
+6. O arquivo e validado localmente.
+7. O arquivo e enviado para Microsoft Graph.
+8. O SnapVault baixa o artefato remoto.
+9. O checksum remoto e conferido.
+10. Um restore temporario e executado.
+11. Se tudo passar, a execucao vira `recoverable`.
+12. A politica de retencao remove backups antigos preservando o minimo configurado.
 
 No SharePoint, a hierarquia usada e:
 

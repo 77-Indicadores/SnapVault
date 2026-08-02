@@ -49,6 +49,8 @@ export type Destination = {
 };
 
 export type MicrosoftIntegration = {
+  id: string;
+  name: string;
   tenantId: string;
   clientId: string;
   encryptedClientSecret: string;
@@ -64,7 +66,7 @@ export type Policy = {
   sourceId: string;
   destinationId: string;
   schedule: {
-    type: "daily" | "weekly" | "cron";
+    type: "manual" | "daily" | "weekly" | "cron";
     cron?: string;
     time?: string;
     weekday?: number;
@@ -132,6 +134,7 @@ export type Database = {
   settings?: {
     microsoft?: MicrosoftIntegration | null;
   };
+  microsoftIntegrations?: MicrosoftIntegration[];
   users: User[];
   sessions: Session[];
   sources: Source[];
