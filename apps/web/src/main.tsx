@@ -44,9 +44,9 @@ type Frequency = "manual" | "daily" | "weekly";
 type Source = { id: string; name: string; type: SourceType | string; status: string; config?: any; metadata?: any; lastTestedAt?: string | null };
 type Destination = { id: string; name: string; type: DestinationType | string; status: string; basePath: string; config?: any; metadata?: any; lastTestedAt?: string | null };
 type BackupRoutine = { id: string; name: string; sourceId: string; destinationId: string; sourceScope?: SourceScope; enabled: boolean; schedule?: { type: string; time?: string; weekday?: number; timezone?: string }; retention?: { keepLast: number; keepDays: number } };
-type Run = { id: string; policyId: string; sourceId?: string; destinationId?: string; status: string; verificationStatus?: string; verifiedAt?: string | null; createdAt: string; bytesWritten: number | null; errorMessage: string | null };
+type Run = { id: string; policyId: string; sourceId?: string; destinationId?: string; status: string; verificationStatus?: string; verifiedAt?: string | null; createdAt: string; finishedAt?: string | null; bytesWritten: number | null; errorMessage: string | null };
 type Artifact = { id: string; kind: string; path: string; sizeBytes: number | null; checksumSha256: string | null };
-type RunDetail = { run: Run; logs: Array<{ message: string; level: string; createdAt: string }>; artifacts: Artifact[] };
+type RunDetail = { run: Run; logs: Array<{ message: string; level: string; createdAt: string; data?: any }>; artifacts: Artifact[] };
 type AppData = { sources: Source[]; destinations: Destination[]; policies: BackupRoutine[]; runs: Run[] };
 type Notice = { tone: "success" | "error"; text: string } | null;
 type RestoreRequest = { runId: string; artifact: Artifact; sourceType: string };
@@ -1016,7 +1016,10 @@ function RunDetailModal({ runId, onClose }: { runId: string; onClose: () => void
             <SectionHeader title="Arquivos" />
             {!detail.artifacts.length ? <EmptyState compact title="Sem arquivos" text="A execucao ainda nao gerou artefatos." /> : detail.artifacts.map((artifact) => <div className="artifactRow" key={artifact.id}><FileArchive size={16} /><div><strong>{artifact.path.split(/[\\/]/).pop() ?? artifact.kind}</strong><span>{artifact.path} · {formatBytes(artifact.sizeBytes)}</span></div></div>)}
             <SectionHeader title="Logs" />
-            <div className="logBox">{detail.logs.length ? detail.logs.map((log, index) => <code key={index}>{formatDate(log.createdAt)} {log.level}: {log.message}</code>) : <code>Sem logs registrados.</code>}</div>
+            <div className="logBox">
+              {detail.run.errorMessage && <code>{formatDate(detail.run.finishedAt ?? detail.run.createdAt)} error: {detail.run.errorMessage}</code>}
+              {detail.logs.length ? detail.logs.map((log, index) => <code key={index}>{formatDate(log.createdAt)} {log.level}: {log.message}{log.data?.error ? ` - ${log.data.error}` : ""}</code>) : <code>Sem logs registrados.</code>}
+            </div>
           </div>
         )}
       </div>
