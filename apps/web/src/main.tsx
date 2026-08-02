@@ -43,13 +43,14 @@ type DestinationType = "sharepoint" | "onedrive";
 type Frequency = "manual" | "daily" | "weekly";
 type Source = { id: string; name: string; type: SourceType | string; status: string; config?: any; metadata?: any; lastTestedAt?: string | null };
 type Destination = { id: string; name: string; type: DestinationType | string; status: string; basePath: string; config?: any; metadata?: any; lastTestedAt?: string | null };
-type BackupRoutine = { id: string; name: string; sourceId: string; destinationId: string; enabled: boolean; schedule?: { type: string; time?: string; weekday?: number; timezone?: string }; retention?: { keepLast: number; keepDays: number } };
+type BackupRoutine = { id: string; name: string; sourceId: string; destinationId: string; sourceScope?: SourceScope; enabled: boolean; schedule?: { type: string; time?: string; weekday?: number; timezone?: string }; retention?: { keepLast: number; keepDays: number } };
 type Run = { id: string; policyId: string; sourceId?: string; destinationId?: string; status: string; verificationStatus?: string; verifiedAt?: string | null; createdAt: string; bytesWritten: number | null; errorMessage: string | null };
 type Artifact = { id: string; kind: string; path: string; sizeBytes: number | null; checksumSha256: string | null };
 type RunDetail = { run: Run; logs: Array<{ message: string; level: string; createdAt: string }>; artifacts: Artifact[] };
 type AppData = { sources: Source[]; destinations: Destination[]; policies: BackupRoutine[]; runs: Run[] };
 type Notice = { tone: "success" | "error"; text: string } | null;
 type RestoreRequest = { runId: string; artifact: Artifact; sourceType: string };
+type SourceScope = { mode: "single" | "all"; database?: string; bucket?: string; prefix?: string };
 type MicrosoftSite = { id: string; displayName?: string; name?: string; webUrl?: string };
 type MicrosoftDrive = { id: string; name: string; webUrl?: string; quota?: any };
 type MicrosoftUser = { id: string; displayName?: string; mail?: string; userPrincipalName?: string };
@@ -322,7 +323,7 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onEdit, on
           )}
         </section>
         <aside className="detailSide">
-          <InfoCard title="Configuracao" rows={[["Origem", source?.name ?? "nao encontrada"], ["Tipo", String(source?.type ?? "-")], ["Destino", destination?.name ?? "nao encontrado"], ["Pasta", destination?.basePath ?? "-"], ["Frequencia", scheduleLabel(policy)], ["Retencao", retentionLabel(policy)]]} />
+          <InfoCard title="Configuracao" rows={[["Origem", source?.name ?? "nao encontrada"], ["Escopo", source ? sourceScopeLabel(source.type as SourceType, policySourceScope(policy, source)) : "-"], ["Destino", destination?.name ?? "nao encontrado"], ["Pasta", destination?.basePath ?? "-"], ["Frequencia", scheduleLabel(policy)], ["Retencao", retentionLabel(policy)]]} />
           <section className="card">
             <SectionHeader title="Recuperacao" />
             <div className="sideCopy">
@@ -427,10 +428,10 @@ function SourcesPage({ data, refresh, openCreate, openEdit, showNotice }: { data
       <section className="sectionBlock">
         {!data.sources.length ? <EmptyState title="Nenhuma origem" text="Conecte PostgreSQL ou MinIO antes de criar uma rotina." /> : (
           <div className="itemList">{data.sources.map((source) => {
-            const scope = source.config?.scope === "all" ? "todos" : source.type === "postgres" ? source.config?.database : source.config?.bucket;
             const deps = dependencyCount(source.id);
             const actionText = source.status === "archived" ? "Reativar" : deps > 0 ? "Arquivar" : "Excluir";
-            return <article className="listItem" key={source.id}><div className="itemMain"><strong>{source.name}</strong><span>{source.type} · {scope || "escopo nao definido"}</span></div><StatusBadge status={source.status} /><div className="rowActions"><button className="secondaryButton small" disabled={busy === source.id || source.status === "archived"} onClick={() => testSource(source.id)}>{busy === source.id ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} Testar</button><button className="secondaryButton small" onClick={() => openEdit(source)}><Pencil size={14} /> Editar</button><button className="secondaryButton small" disabled={busy === source.id} onClick={() => deleteSource(source)}>{source.status === "archived" ? <RefreshCw size={14} /> : <Trash2 size={14} />} {actionText}</button></div></article>;
+            const endpoint = source.type === "postgres" ? `${source.config?.host ?? "-"}:${source.config?.port ?? 5432}` : source.config?.endpoint ?? "-";
+            return <article className="listItem" key={source.id}><div className="itemMain"><strong>{source.name}</strong><span>{source.type} · {endpoint}</span></div><StatusBadge status={source.status} /><div className="rowActions"><button className="secondaryButton small" disabled={busy === source.id || source.status === "archived"} onClick={() => testSource(source.id)}>{busy === source.id ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} Testar</button><button className="secondaryButton small" onClick={() => openEdit(source)}><Pencil size={14} /> Editar</button><button className="secondaryButton small" disabled={busy === source.id} onClick={() => deleteSource(source)}>{source.status === "archived" ? <RefreshCw size={14} /> : <Trash2 size={14} />} {actionText}</button></div></article>;
           })}</div>
         )}
       </section>
@@ -579,6 +580,11 @@ function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDon
   const [frequency, setFrequency] = useState<Frequency>("daily");
   const [selectedSourceId, setSelectedSourceId] = useState(data.sources.find((source) => source.type === "postgres" && source.status === "healthy")?.id ?? "");
   const [selectedDestinationId, setSelectedDestinationId] = useState(preferredDestination?.id ?? "");
+  const [scopeMode, setScopeMode] = useState<"single" | "all">("single");
+  const [selectedResource, setSelectedResource] = useState("");
+  const [prefix, setPrefix] = useState("");
+  const [resourceOptions, setResourceOptions] = useState<string[]>([]);
+  const [resourceBusy, setResourceBusy] = useState(false);
   const [routineName, setRoutineName] = useState("Backup diario");
   const [keepLast, setKeepLast] = useState(7);
   const [keepDays, setKeepDays] = useState(30);
@@ -593,8 +599,9 @@ function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDon
       if (!sourceId) throw new Error("Conecte e teste uma origem antes de criar a rotina.");
       let destinationId = selectedDestinationId;
       if (!destinationId) throw new Error("Conecte e teste um armazenamento antes de criar a rotina.");
+      const sourceScope = buildSourceScope(sourceType, scopeMode, selectedResource, prefix);
       const schedule = frequency === "manual" ? { type: "manual", timezone: "America/Sao_Paulo" } : { type: frequency, time: "02:00", timezone: "America/Sao_Paulo" };
-      const policy = await api("/policies", { method: "POST", body: JSON.stringify({ name: routineName, sourceId, destinationId, schedule, retention: { keepLast, keepDays }, options: { compression: "gzip", encryption: false, verifyAfterUpload: true }, enabled: true }) });
+      const policy = await api("/policies", { method: "POST", body: JSON.stringify({ name: routineName, sourceId, destinationId, sourceScope, schedule, retention: { keepLast, keepDays }, options: { compression: "gzip", encryption: false, verifyAfterUpload: true }, enabled: true }) });
       const run = await api(`/policies/${policy.policy.id}/run`, { method: "POST", body: "{}" });
       onDone(run.runId);
     } catch (err: any) {
@@ -605,6 +612,19 @@ function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDon
   };
 
   const availableSources = data.sources.filter((source) => source.type === sourceType && source.status === "healthy");
+  useEffect(() => {
+    if (!selectedSourceId) {
+      setResourceOptions([]);
+      setSelectedResource("");
+      return;
+    }
+    setResourceBusy(true);
+    api(`/sources/${selectedSourceId}/test`, { method: "POST", body: "{}" }).then((result) => {
+      const options = sourceType === "postgres" ? result.resources.databases ?? [] : result.resources.buckets ?? [];
+      setResourceOptions(options);
+      setSelectedResource((current) => current || options[0] || "");
+    }).catch((err) => setError(err.message)).finally(() => setResourceBusy(false));
+  }, [selectedSourceId, sourceType]);
   return (
     <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Novo backup">
       <div className="wizard">
@@ -618,6 +638,9 @@ function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDon
             <Choice active={sourceType === "postgres"} icon={<Database size={18} />} title="PostgreSQL" text="Escolha um banco ou todos os bancos permitidos." onClick={() => { setSourceType("postgres"); setSelectedSourceId(data.sources.find((source) => source.type === "postgres" && source.status === "healthy")?.id ?? ""); }} />
             <Choice active={sourceType === "minio"} icon={<HardDrive size={18} />} title="MinIO" text="Escolha um bucket ou todos os buckets permitidos." onClick={() => { setSourceType("minio"); setSelectedSourceId(data.sources.find((source) => source.type === "minio" && source.status === "healthy")?.id ?? ""); }} />
             {availableSources.length > 0 && <Field label="Origem pronta"><select value={selectedSourceId} onChange={(e) => setSelectedSourceId(e.target.value)}><option value="">Escolha uma origem</option>{availableSources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}</select></Field>}
+            {selectedSourceId && <Field label="Escopo desta rotina"><select value={scopeMode} onChange={(e) => setScopeMode(e.target.value as any)}><option value="single">{sourceType === "postgres" ? "Um database" : "Um bucket"}</option><option value="all">{sourceType === "postgres" ? "Todos os databases acessiveis" : "Todos os buckets acessiveis"}</option></select></Field>}
+            {selectedSourceId && scopeMode === "single" && <Field label={sourceType === "postgres" ? "Database" : "Bucket"}><select value={selectedResource} onChange={(e) => setSelectedResource(e.target.value)} disabled={resourceBusy}><option value="">{resourceBusy ? "Carregando..." : "Escolha"}</option>{resourceOptions.map((item) => <option key={item} value={item}>{item}</option>)}</select></Field>}
+            {selectedSourceId && sourceType === "minio" && scopeMode === "single" && <Field label="Prefixo opcional"><input value={prefix} onChange={(e) => setPrefix(e.target.value)} placeholder="ex: uploads/2026" /></Field>}
             {!availableSources.length && <EmptyState compact title="Nenhuma origem pronta" text="Conecte PostgreSQL ou MinIO, liste databases/buckets e rode o teste." />}
             <button className="secondaryButton full" onClick={onCreateSource}><Plus size={15} /> Conectar origem</button>
           </ChoiceGrid>
@@ -646,7 +669,7 @@ function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDon
         )}
         {step === 4 && (
           <div className="reviewBox">
-            <ReviewRow label="O que proteger" value={sourceType === "postgres" ? "PostgreSQL" : "MinIO"} />
+            <ReviewRow label="O que proteger" value={sourceScopeLabel(sourceType, buildSourceScope(sourceType, scopeMode, selectedResource, prefix))} />
             <ReviewRow label="Onde salvar" value={selectedDestinationId ? data.destinations.find((item) => item.id === selectedDestinationId)?.name ?? "Armazenamento" : destinationType === "sharepoint" ? "SharePoint" : "OneDrive"} />
             <ReviewRow label="Quando rodar" value={frequency === "daily" ? "Diario, 02:00" : frequency === "weekly" ? "Semanal" : "Manual"} />
             <ReviewRow label="Retencao" value={`manter ${keepLast}; limpar apos ${keepDays} dias`} />
@@ -656,7 +679,7 @@ function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDon
         {error && <p className="formError">{error}</p>}
         <footer className="wizardFooter">
           <button className="secondaryButton" onClick={() => step === 1 ? onClose() : setStep(step - 1)}>{step === 1 ? "Cancelar" : <><ChevronLeft size={15} /> Voltar</>}</button>
-          {step < 4 ? <button className="primaryButton" onClick={() => setStep(step + 1)}>Continuar</button> : <button className="primaryButton" onClick={complete} disabled={busy}>{busy ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Criar e executar</button>}
+          {step < 4 ? <button className="primaryButton" disabled={step === 1 && (!selectedSourceId || (scopeMode === "single" && !selectedResource))} onClick={() => setStep(step + 1)}>Continuar</button> : <button className="primaryButton" onClick={complete} disabled={busy}>{busy ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Criar e executar</button>}
         </footer>
       </div>
     </div>
@@ -669,15 +692,11 @@ function SourceWizard({ source, onClose, onDone }: { source?: Source; onClose: (
   const [name, setName] = useState(source?.name ?? "PostgreSQL");
   const [host, setHost] = useState(String(source?.config?.host ?? "postgres"));
   const [port, setPort] = useState(String(source?.config?.port ?? 5432));
-  const [database, setDatabase] = useState(String(source?.config?.database ?? ""));
   const [username, setUsername] = useState(String(source?.config?.username ?? "postgres"));
   const [password, setPassword] = useState("");
   const [endpoint, setEndpoint] = useState(String(source?.config?.endpoint ?? "http://minio:9000"));
-  const [bucket, setBucket] = useState(String(source?.config?.bucket ?? ""));
-  const [prefix, setPrefix] = useState(String(source?.config?.prefix ?? ""));
   const [accessKey, setAccessKey] = useState("");
   const [secretKey, setSecretKey] = useState("");
-  const [scope, setScope] = useState<"single" | "all">(source?.config?.scope === "all" ? "all" : "single");
   const [resources, setResources] = useState<string[]>([]);
   const [draftId, setDraftId] = useState(source?.id ?? "");
   const [busy, setBusy] = useState("");
@@ -685,8 +704,8 @@ function SourceWizard({ source, onClose, onDone }: { source?: Source; onClose: (
 
   const buildBody = () => {
     const body: any = type === "postgres"
-      ? { name, type, config: { host, port: Number(port), database, username, scope } }
-      : { name, type, config: { endpoint, bucket, prefix, scope } };
+      ? { name, type, config: { host, port: Number(port), username } }
+      : { name, type, config: { endpoint } };
     if (type === "postgres" && password) body.secrets = { password };
     if (type === "minio" && (accessKey || secretKey)) body.secrets = { accessKey, secretKey };
     return body;
@@ -708,10 +727,6 @@ function SourceWizard({ source, onClose, onDone }: { source?: Source; onClose: (
       const result = await api(`/sources/${saved.id}/test`, { method: "POST", body: "{}" });
       const nextResources = type === "postgres" ? result.resources.databases : result.resources.buckets;
       setResources(nextResources);
-      if (scope === "single" && nextResources.length > 0) {
-        if (type === "postgres" && !database) setDatabase(nextResources[0]);
-        if (type === "minio" && !bucket) setBucket(nextResources[0]);
-      }
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -737,23 +752,18 @@ function SourceWizard({ source, onClose, onDone }: { source?: Source; onClose: (
       <div className="wizard compactWizard">
         <header className="wizardHeader"><div><span>Source</span><h2>{editing ? "Editar origem" : "Conectar origem"}</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
         <ChoiceGrid>
-          <Choice active={type === "postgres"} icon={<Database size={18} />} title="PostgreSQL" text="Liste databases e escolha um ou todos." onClick={() => { setType("postgres"); setName("PostgreSQL"); }} />
-          <Choice active={type === "minio"} icon={<HardDrive size={18} />} title="MinIO" text="Liste buckets e escolha um ou todos." onClick={() => { setType("minio"); setName("MinIO"); }} />
+          <Choice active={type === "postgres"} icon={<Database size={18} />} title="PostgreSQL" text="Conexao reutilizavel; databases sao escolhidos na rotina." onClick={() => { setType("postgres"); setName("PostgreSQL"); }} />
+          <Choice active={type === "minio"} icon={<HardDrive size={18} />} title="MinIO" text="Conexao reutilizavel; buckets sao escolhidos na rotina." onClick={() => { setType("minio"); setName("MinIO"); }} />
           <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} /></Field>
           {type === "postgres" ? <>
             <div className="fieldPair"><Field label="Host"><input value={host} onChange={(e) => setHost(e.target.value)} /></Field><Field label="Porta"><input type="number" value={port} onChange={(e) => setPort(e.target.value)} /></Field></div>
             <Field label="Usuario"><input value={username} onChange={(e) => setUsername(e.target.value)} /></Field>
             <Field label={source ? "Senha nova opcional" : "Senha"}><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
-            <Field label="Escopo"><select value={scope} onChange={(e) => setScope(e.target.value as any)}><option value="single">Selecionar database</option><option value="all">Todos os databases acessiveis</option></select></Field>
-            {scope === "single" && <Field label="Database"><input value={database} onChange={(e) => setDatabase(e.target.value)} placeholder="teste e liste para evitar erro de nome" /></Field>}
           </> : <>
             <Field label="Endpoint"><input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} /></Field>
             <div className="fieldPair"><Field label="Access Key"><input value={accessKey} onChange={(e) => setAccessKey(e.target.value)} /></Field><Field label={source ? "Secret Key nova opcional" : "Secret Key"}><input type="password" value={secretKey} onChange={(e) => setSecretKey(e.target.value)} /></Field></div>
-            <Field label="Escopo"><select value={scope} onChange={(e) => setScope(e.target.value as any)}><option value="single">Selecionar bucket</option><option value="all">Todos os buckets acessiveis</option></select></Field>
-            {scope === "single" && <Field label="Bucket"><input value={bucket} onChange={(e) => setBucket(e.target.value)} placeholder="teste e liste para evitar erro de nome" /></Field>}
-            <Field label="Prefixo opcional"><input value={prefix} onChange={(e) => setPrefix(e.target.value)} /></Field>
           </>}
-          {resources.length > 0 && <Field label={type === "postgres" ? "Encontrados" : "Buckets encontrados"}><select value={type === "postgres" ? database : bucket} onChange={(e) => type === "postgres" ? setDatabase(e.target.value) : setBucket(e.target.value)}><option value="">Escolha</option>{resources.map((item) => <option key={item} value={item}>{item}</option>)}</select></Field>}
+          {resources.length > 0 && <div className="quotaBox"><strong>{type === "postgres" ? "Databases encontrados" : "Buckets encontrados"}</strong><span>{resources.slice(0, 6).join(", ")}{resources.length > 6 ? ` e mais ${resources.length - 6}` : ""}</span></div>}
         </ChoiceGrid>
         {error && <p className="formError">{error}</p>}
         <footer className="wizardFooter"><button className="secondaryButton" onClick={onClose}>Cancelar</button><div className="footerActions inline"><button className="secondaryButton" disabled={busy === "save"} onClick={saveOnly}>{busy === "save" ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Salvar</button><button className="primaryButton" disabled={busy === "test"} onClick={testAndSave}>{busy === "test" ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />} Testar e listar</button></div></footer>
@@ -869,9 +879,16 @@ function StorageWizard({ destination, onClose, onDone }: { destination?: Destina
 }
 
 function PolicyWizard({ data, policy, onClose, onDone }: { data: AppData; policy: BackupRoutine; onClose: () => void; onDone: () => void }) {
+  const initialSource = data.sources.find((item) => item.id === policy.sourceId);
+  const initialScope = policySourceScope(policy, initialSource);
   const [name, setName] = useState(policy.name);
   const [sourceId, setSourceId] = useState(policy.sourceId);
   const [destinationId, setDestinationId] = useState(policy.destinationId);
+  const [scopeMode, setScopeMode] = useState<"single" | "all">(initialScope.mode);
+  const [selectedResource, setSelectedResource] = useState(initialScope.database ?? initialScope.bucket ?? "");
+  const [prefix, setPrefix] = useState(initialScope.prefix ?? "");
+  const [resourceOptions, setResourceOptions] = useState<string[]>([]);
+  const [resourceBusy, setResourceBusy] = useState(false);
   const [frequency, setFrequency] = useState<Frequency>((policy.schedule?.type as Frequency) ?? "daily");
   const [time, setTime] = useState(policy.schedule?.time ?? "02:00");
   const [weekday, setWeekday] = useState(Number(policy.schedule?.weekday ?? 0));
@@ -882,12 +899,23 @@ function PolicyWizard({ data, policy, onClose, onDone }: { data: AppData; policy
   const [error, setError] = useState("");
   const healthySources = data.sources.filter((item) => item.status === "healthy" || item.id === policy.sourceId);
   const healthyDestinations = data.destinations.filter((item) => item.status === "healthy" || item.id === policy.destinationId);
+  const selectedSource = data.sources.find((item) => item.id === sourceId);
+  useEffect(() => {
+    if (!sourceId || !selectedSource) return;
+    setResourceBusy(true);
+    api(`/sources/${sourceId}/test`, { method: "POST", body: "{}" }).then((result) => {
+      const options = selectedSource.type === "postgres" ? result.resources.databases ?? [] : result.resources.buckets ?? [];
+      setResourceOptions(options);
+      setSelectedResource((current) => current || options[0] || "");
+    }).catch((err) => setError(err.message)).finally(() => setResourceBusy(false));
+  }, [sourceId]);
   const save = async () => {
     setBusy(true);
     setError("");
     try {
       const schedule = frequency === "manual" ? { type: "manual", timezone: "America/Sao_Paulo" } : { type: frequency, time, weekday, timezone: "America/Sao_Paulo" };
-      await api(`/policies/${policy.id}`, { method: "PATCH", body: JSON.stringify({ name, sourceId, destinationId, schedule, retention: { keepLast, keepDays }, enabled }) });
+      const sourceScope = buildSourceScope(selectedSource?.type === "minio" ? "minio" : "postgres", scopeMode, selectedResource, prefix);
+      await api(`/policies/${policy.id}`, { method: "PATCH", body: JSON.stringify({ name, sourceId, destinationId, sourceScope, schedule, retention: { keepLast, keepDays }, enabled }) });
       onDone();
     } catch (err: any) {
       setError(err.message);
@@ -901,7 +929,10 @@ function PolicyWizard({ data, policy, onClose, onDone }: { data: AppData; policy
         <header className="wizardHeader"><div><span>Backup</span><h2>Editar rotina</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
         <ChoiceGrid>
           <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} /></Field>
-          <Field label="O que proteger"><select value={sourceId} onChange={(e) => setSourceId(e.target.value)}>{healthySources.map((item) => <option key={item.id} value={item.id}>{item.name} - {item.type}</option>)}</select></Field>
+          <Field label="Conexao"><select value={sourceId} onChange={(e) => { setSourceId(e.target.value); setSelectedResource(""); }}><option value="">Escolha</option>{healthySources.map((item) => <option key={item.id} value={item.id}>{item.name} - {item.type}</option>)}</select></Field>
+          {selectedSource && <Field label="O que proteger"><select value={scopeMode} onChange={(e) => setScopeMode(e.target.value as any)}><option value="single">{selectedSource.type === "postgres" ? "Um database" : "Um bucket"}</option><option value="all">{selectedSource.type === "postgres" ? "Todos os databases acessiveis" : "Todos os buckets acessiveis"}</option></select></Field>}
+          {selectedSource && scopeMode === "single" && <Field label={selectedSource.type === "postgres" ? "Database" : "Bucket"}><select value={selectedResource} onChange={(e) => setSelectedResource(e.target.value)} disabled={resourceBusy}><option value="">{resourceBusy ? "Carregando..." : "Escolha"}</option>{resourceOptions.map((item) => <option key={item} value={item}>{item}</option>)}</select></Field>}
+          {selectedSource?.type === "minio" && scopeMode === "single" && <Field label="Prefixo opcional"><input value={prefix} onChange={(e) => setPrefix(e.target.value)} /></Field>}
           <Field label="Onde salvar"><select value={destinationId} onChange={(e) => setDestinationId(e.target.value)}>{healthyDestinations.map((item) => <option key={item.id} value={item.id}>{item.name} - {item.basePath}</option>)}</select></Field>
           <Field label="Frequencia"><select value={frequency} onChange={(e) => setFrequency(e.target.value as Frequency)}><option value="manual">Manual</option><option value="daily">Diario</option><option value="weekly">Semanal</option></select></Field>
           {frequency !== "manual" && <div className="fieldPair"><Field label="Horario UTC"><input type="time" value={time} onChange={(e) => setTime(e.target.value)} /></Field><Field label="Dia semanal"><select value={weekday} onChange={(e) => setWeekday(Number(e.target.value))} disabled={frequency !== "weekly"}><option value={0}>Domingo</option><option value={1}>Segunda</option><option value={2}>Terca</option><option value={3}>Quarta</option><option value={4}>Quinta</option><option value={5}>Sexta</option><option value={6}>Sabado</option></select></Field></div>}
@@ -916,15 +947,30 @@ function PolicyWizard({ data, policy, onClose, onDone }: { data: AppData; policy
 }
 
 function RestoreExecuteModal({ data, request, onClose, onDone }: { data: AppData; request: RestoreRequest; onClose: () => void; onDone: () => void }) {
-  const targets = data.sources.filter((source) => source.type === request.sourceType && source.status === "healthy" && source.config?.scope !== "all");
+  const targets = data.sources.filter((source) => source.type === request.sourceType && source.status === "healthy");
   const [targetSourceId, setTargetSourceId] = useState(targets[0]?.id ?? "");
+  const [targetResource, setTargetResource] = useState("");
+  const [targetPrefix, setTargetPrefix] = useState("");
+  const [resourceOptions, setResourceOptions] = useState<string[]>([]);
+  const [resourceBusy, setResourceBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const targetSource = data.sources.find((source) => source.id === targetSourceId);
+  useEffect(() => {
+    if (!targetSourceId || !targetSource) return;
+    setResourceBusy(true);
+    api(`/sources/${targetSourceId}/test`, { method: "POST", body: "{}" }).then((result) => {
+      const options = targetSource.type === "postgres" ? result.resources.databases ?? [] : result.resources.buckets ?? [];
+      setResourceOptions(options);
+      setTargetResource((current) => current || options[0] || "");
+    }).catch((err) => setError(err.message)).finally(() => setResourceBusy(false));
+  }, [targetSourceId]);
   const execute = async () => {
     setBusy(true);
     setError("");
     try {
-      await api("/restores/execute", { method: "POST", body: JSON.stringify({ artifactId: request.artifact.id, targetSourceId }) });
+      const targetScope = targetSource?.type === "minio" ? { mode: "single", bucket: targetResource, prefix: targetPrefix } : { mode: "single", database: targetResource };
+      await api("/restores/execute", { method: "POST", body: JSON.stringify({ artifactId: request.artifact.id, targetSourceId, targetScope }) });
       onDone();
     } catch (err: any) {
       setError(err.message);
@@ -941,9 +987,9 @@ function RestoreExecuteModal({ data, request, onClose, onDone }: { data: AppData
           <ReviewRow label="Artefato" value={request.artifact.path.split(/[\\/]/).pop() ?? request.artifact.kind} />
           <ReviewRow label="Tamanho" value={formatBytes(request.artifact.sizeBytes)} />
         </div>
-        {!targets.length ? <EmptyState compact title="Sem destino compativel" text="Crie e teste uma origem saudavel do mesmo tipo, com database ou bucket unico, para executar restore." /> : <ChoiceGrid><Field label="Restaurar em"><select value={targetSourceId} onChange={(e) => setTargetSourceId(e.target.value)}>{targets.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}</select></Field></ChoiceGrid>}
+        {!targets.length ? <EmptyState compact title="Sem destino compativel" text="Crie e teste uma origem saudavel do mesmo tipo para executar restore." /> : <ChoiceGrid><Field label="Conexao alvo"><select value={targetSourceId} onChange={(e) => { setTargetSourceId(e.target.value); setTargetResource(""); }}>{targets.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}</select></Field><Field label={targetSource?.type === "minio" ? "Bucket alvo" : "Database alvo"}><select value={targetResource} onChange={(e) => setTargetResource(e.target.value)} disabled={resourceBusy}><option value="">{resourceBusy ? "Carregando..." : "Escolha"}</option>{resourceOptions.map((item) => <option key={item} value={item}>{item}</option>)}</select></Field>{targetSource?.type === "minio" && <Field label="Prefixo alvo opcional"><input value={targetPrefix} onChange={(e) => setTargetPrefix(e.target.value)} /></Field>}</ChoiceGrid>}
         {error && <p className="formError">{error}</p>}
-        <footer className="wizardFooter"><button className="secondaryButton" onClick={onClose}>Cancelar</button><button className="primaryButton" disabled={busy || !targetSourceId} onClick={execute}>{busy ? <Loader2 className="spin" size={15} /> : <RotateCcw size={15} />} Executar restore</button></footer>
+        <footer className="wizardFooter"><button className="secondaryButton" onClick={onClose}>Cancelar</button><button className="primaryButton" disabled={busy || !targetSourceId || !targetResource} onClick={execute}>{busy ? <Loader2 className="spin" size={15} /> : <RotateCcw size={15} />} Executar restore</button></footer>
       </div>
     </div>
   );
@@ -1028,11 +1074,12 @@ function BackupList({ data, onRun, onPolicyOpen, onEdit, busy, limit, onToggle, 
         const source = data.sources.find((item) => item.id === policy.sourceId);
         const destination = data.destinations.find((item) => item.id === policy.destinationId);
         const lastRun = data.runs.find((run) => run.policyId === policy.id);
+        const scope = source ? sourceScopeLabel(source.type as SourceType, policySourceScope(policy, source)) : "origem";
         return (
           <article className="listItem" key={policy.id}>
             <button className="itemMain itemButton" onClick={() => onPolicyOpen(policy.id)}>
               <strong>{policy.name}</strong>
-              <span>{source?.type ?? "origem"} para {destination?.type ?? "armazenamento"} · {policy.enabled ? "ativo" : "pausado"}</span>
+              <span>{scope} para {destination?.type ?? "armazenamento"} · {policy.enabled ? "ativo" : "pausado"}</span>
             </button>
             <StatusBadge status={policy.enabled ? lastRun?.status ?? "ready" : "paused"} />
             <div className="rowActions">
@@ -1146,6 +1193,23 @@ function scheduleLabel(policy: BackupRoutine) {
   if (type === "weekly") return `semanal, ${time}`;
   if (type === "daily") return `diario, ${time}`;
   return "manual";
+}
+
+function buildSourceScope(sourceType: SourceType, mode: "single" | "all", resource: string, prefix = ""): SourceScope {
+  if (sourceType === "postgres") return mode === "all" ? { mode } : { mode, database: resource };
+  return mode === "all" ? { mode } : { mode, bucket: resource, prefix };
+}
+
+function policySourceScope(policy: BackupRoutine, source?: Source): SourceScope {
+  if (policy.sourceScope?.mode) return policy.sourceScope;
+  if (source?.type === "postgres") return { mode: source.config?.scope === "all" ? "all" : "single", database: source.config?.database ?? "" };
+  return { mode: source?.config?.scope === "all" ? "all" : "single", bucket: source?.config?.bucket ?? "", prefix: source?.config?.prefix ?? "" };
+}
+
+function sourceScopeLabel(sourceType: SourceType, scope: SourceScope) {
+  if (scope.mode === "all") return sourceType === "postgres" ? "Todos os databases" : "Todos os buckets";
+  if (sourceType === "postgres") return `Database ${scope.database || "-"}`;
+  return `Bucket ${scope.bucket || "-"}${scope.prefix ? `/${scope.prefix}` : ""}`;
 }
 
 function retentionLabel(policy: BackupRoutine) {

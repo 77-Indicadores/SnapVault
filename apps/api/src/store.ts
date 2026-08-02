@@ -112,5 +112,22 @@ function migrateDatabase(db: Database): Database {
       source.lastTestedAt = source.lastTestedAt ?? now();
     }
   }
+  for (const policy of db.policies) {
+    const source = db.sources.find((item) => item.id === policy.sourceId);
+    if (!source || policy.sourceScope) continue;
+    if (source.type === "postgres") {
+      policy.sourceScope = {
+        mode: source.config.scope === "all" ? "all" : "single",
+        database: String(source.config.database ?? "")
+      };
+    }
+    if (source.type === "minio") {
+      policy.sourceScope = {
+        mode: source.config.scope === "all" ? "all" : "single",
+        bucket: String(source.config.bucket ?? ""),
+        prefix: String(source.config.prefix ?? "")
+      };
+    }
+  }
   return db;
 }
