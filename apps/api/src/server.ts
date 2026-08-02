@@ -479,6 +479,7 @@ app.post("/api/v1/policies", { preHandler: requireAuth }, async (request) => {
     const destination = db.destinations.find((item) => item.id === body.destinationId);
     if (!destination) throw new Error("Destination not found");
     if (destination.status !== "healthy") throw new Error("Destination must be tested and healthy before creating a backup routine");
+    assertDestinationReady(destination);
     validatePolicyScope(source, body.sourceScope);
     db.policies.push(policy);
   });
@@ -498,6 +499,7 @@ app.patch("/api/v1/policies/:id", { preHandler: requireAuth }, async (request) =
     if (body.destinationId) {
       const destination = db.destinations.find((item) => item.id === body.destinationId);
       if (!destination || destination.status !== "healthy") throw new Error("Destination must be healthy");
+      assertDestinationReady(destination);
     }
     const source = db.sources.find((item) => item.id === (body.sourceId ?? target.sourceId));
     if (source && body.sourceScope) validatePolicyScope(source, body.sourceScope);
@@ -526,6 +528,7 @@ app.post("/api/v1/policies/:id/run", { preHandler: requireAuth }, async (request
     const destination = db.destinations.find((item) => item.id === policy.destinationId);
     if (!destination) throw new Error("Destination not found");
     if (destination.status !== "healthy") throw new Error("Destination must be healthy before running a backup");
+    assertDestinationReady(destination);
     const created: any = { id: id("run"), policyId: policy.id, sourceId: policy.sourceId, destinationId: policy.destinationId, trigger: "manual", status: "queued", startedAt: null, finishedAt: null, durationMs: null, bytesWritten: null, errorCode: null, errorMessage: null, verificationStatus: "not_checked", verifiedAt: null, createdAt: now() };
     db.runs.push(created);
     return created;
@@ -625,6 +628,14 @@ function resolveSourceScope(source: any, scope?: any) {
   if (scope?.mode) return scope;
   if (source.type === "postgres") return { mode: sourceConfig.scope === "all" ? "all" : "single", database: sourceConfig.database };
   return { mode: sourceConfig.scope === "all" ? "all" : "single", bucket: sourceConfig.bucket, prefix: sourceConfig.prefix ?? "" };
+}
+
+function assertDestinationReady(destination: any) {
+  if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config?.mode === "graph") {
+    const hasDriveTarget = Boolean(destination.config.driveId || destination.config.userPrincipalName || destination.config.siteId || (destination.config.hostname && destination.config.sitePath));
+    if (!hasDriveTarget) throw new Error("Microsoft storage is incomplete. Edit Storage, choose site/library or OneDrive user, then test again.");
+    if (!destination.config.microsoftIntegrationId) throw new Error("Microsoft storage has no integration selected. Edit Storage and choose an integration.");
+  }
 }
 
 async function createSession(reply: any, userId: string) {
@@ -764,6 +775,12 @@ function startScheduler() {
         const source = db.sources.find((item) => item.id === policy.sourceId);
         const destination = db.destinations.find((item) => item.id === policy.destinationId);
         if (source?.status !== "healthy" || destination?.status !== "healthy") continue;
+        try {
+          assertDestinationReady(destination);
+        } catch (error) {
+          app.log.warn({ policyId: policy.id, error }, "Scheduled backup skipped because destination is incomplete");
+          continue;
+        }
         const run = await store.update((next) => {
           const created: any = { id: id("run"), policyId: policy.id, sourceId: policy.sourceId, destinationId: policy.destinationId, trigger: "scheduled", status: "queued", startedAt: null, finishedAt: null, durationMs: null, bytesWritten: null, errorCode: null, errorMessage: null, verificationStatus: "not_checked", verifiedAt: null, createdAt: now() };
           next.runs.push(created);

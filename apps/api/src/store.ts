@@ -100,6 +100,10 @@ function migrateDatabase(db: Database): Database {
     if ((destination.type === "sharepoint" || destination.type === "onedrive") && destination.config?.mode === "graph" && defaultIntegrationId && !destination.config.microsoftIntegrationId) {
       destination.config.microsoftIntegrationId = defaultIntegrationId;
     }
+    if ((destination.type === "sharepoint" || destination.type === "onedrive") && destination.config?.mode === "graph") {
+      const hasDriveTarget = Boolean(destination.config.driveId || destination.config.userPrincipalName || destination.config.siteId || (destination.config.hostname && destination.config.sitePath));
+      if (!hasDriveTarget && destination.status === "healthy") destination.status = "untested";
+    }
     destination.metadata = destination.metadata ?? {};
     destination.archivedAt = destination.archivedAt ?? null;
   }
