@@ -244,7 +244,20 @@ async function uploadArtifacts(destination: Destination, source: Source, run: Ba
     const remotePath = `${base}/${datedPrefix}/${name}`;
     let storedPath = file;
     if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
-      const uploaded = await uploadToMicrosoftDrive(destination.config as any, destination.basePath, file, datedPrefix, microsoftCredentials);
+      let lastLoggedPercent = -1;
+      const uploaded = await uploadToMicrosoftDrive(destination.config as any, destination.basePath, file, datedPrefix, microsoftCredentials, async (progress) => {
+        const percent = Math.floor((progress.uploadedBytes / progress.sizeBytes) * 100);
+        const shouldLog = progress.chunkIndex === 1 || percent === 100 || percent >= lastLoggedPercent + 10;
+        if (!shouldLog) return;
+        lastLoggedPercent = percent;
+        await log("info", "Microsoft Graph large upload progress", {
+          percent,
+          uploadedBytes: progress.uploadedBytes,
+          sizeBytes: progress.sizeBytes,
+          chunkIndex: progress.chunkIndex,
+          totalChunks: progress.totalChunks
+        });
+      });
       storedPath = uploaded.path;
       await log("info", "Uploaded artifact to Microsoft Graph", { path: uploaded.path, drive: uploaded.drive.label, uploadMode: uploaded.uploadMode, sizeBytes: uploaded.sizeBytes, chunkSize: uploaded.chunkSize });
     } else if (hasRclone && destination.config.rcloneRemoteName) {

@@ -26,6 +26,14 @@ export type MicrosoftCredentials = {
   clientSecret: string;
 };
 
+type UploadProgress = {
+  uploadedBytes: number;
+  sizeBytes: number;
+  chunkIndex: number;
+  totalChunks: number;
+  chunkSize: number;
+};
+
 export async function getMicrosoftToken(credentials: MicrosoftCredentials = config.microsoft) {
   if (!credentials.clientId || !credentials.clientSecret || !credentials.tenantId) {
     throw new Error("Microsoft credentials are not configured");
@@ -51,7 +59,14 @@ export async function microsoftCredentialStatus(credentials: MicrosoftCredential
   return { ok: true, tokenType: "Bearer", tokenPresent: token.length > 0 };
 }
 
-export async function uploadToMicrosoftDrive(destinationConfig: MicrosoftDestinationConfig, basePath: string, localFile: string, remotePath: string, credentials?: MicrosoftCredentials) {
+export async function uploadToMicrosoftDrive(
+  destinationConfig: MicrosoftDestinationConfig,
+  basePath: string,
+  localFile: string,
+  remotePath: string,
+  credentials?: MicrosoftCredentials,
+  onProgress?: (progress: UploadProgress) => Promise<void> | void
+) {
   const token = await getMicrosoftToken(credentials);
   const target = await resolveDrive(token, destinationConfig);
   const cleanBase = basePath.replace(/^\/+|\/+$/g, "");
@@ -59,7 +74,7 @@ export async function uploadToMicrosoftDrive(destinationConfig: MicrosoftDestina
   const uploadPath = [cleanBase, cleanRemote, basename(localFile)].filter(Boolean).join("/");
   const fileInfo = await stat(localFile);
   if (fileInfo.size > 4 * 1024 * 1024) {
-    return uploadLargeFileToMicrosoftDrive(token, target, uploadPath, localFile, fileInfo.size);
+    return uploadLargeFileToMicrosoftDrive(token, target, uploadPath, localFile, fileInfo.size, onProgress);
   }
   const bytes = await readFile(localFile);
   const response = await graphFetch(token, `https://graph.microsoft.com/v1.0/drives/${target.driveId}/root:/${encodePath(uploadPath)}:/content`, {
@@ -184,7 +199,14 @@ async function graphFetch(token: string, url: string, init: RequestInit = {}) {
   return response;
 }
 
-async function uploadLargeFileToMicrosoftDrive(token: string, target: GraphDriveTarget, uploadPath: string, localFile: string, sizeBytes: number) {
+async function uploadLargeFileToMicrosoftDrive(
+  token: string,
+  target: GraphDriveTarget,
+  uploadPath: string,
+  localFile: string,
+  sizeBytes: number,
+  onProgress?: (progress: UploadProgress) => Promise<void> | void
+) {
   const sessionResponse = await graphFetch(token, `https://graph.microsoft.com/v1.0/drives/${target.driveId}/root:/${encodePath(uploadPath)}:/createUploadSession`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -198,11 +220,14 @@ async function uploadLargeFileToMicrosoftDrive(token: string, target: GraphDrive
   const session = await sessionResponse.json();
   if (!session.uploadUrl) throw new Error("Microsoft Graph upload session did not return uploadUrl");
   const chunkSize = 10 * 1024 * 1024;
+  const totalChunks = Math.ceil(sizeBytes / chunkSize);
   const handle = await open(localFile, "r");
   try {
     let offset = 0;
+    let chunkIndex = 0;
     let lastResponse: any = null;
     while (offset < sizeBytes) {
+      chunkIndex += 1;
       const remaining = sizeBytes - offset;
       const length = Math.min(chunkSize, remaining);
       const buffer = Buffer.allocUnsafe(length);
@@ -222,6 +247,7 @@ async function uploadLargeFileToMicrosoftDrive(token: string, target: GraphDrive
       if (!response.ok) throw new Error(data.error?.message ?? `Microsoft Graph chunk upload failed with ${response.status}`);
       lastResponse = data;
       offset += bytesRead;
+      await onProgress?.({ uploadedBytes: offset, sizeBytes, chunkIndex, totalChunks, chunkSize });
     }
     return { id: lastResponse.id as string, name: lastResponse.name as string, webUrl: lastResponse.webUrl as string, path: uploadPath, drive: target, uploadMode: "session", sizeBytes, chunkSize };
   } finally {
