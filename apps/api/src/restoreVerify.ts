@@ -12,7 +12,7 @@ type Logger = (level: JobLogEntry["level"], message: string, data?: Record<strin
 
 export async function verifyRestoreForRun(store: Store, runId: string, stagingRoot: string) {
   const context = await loadContext(store, runId);
-  const { run, source, destination, artifact } = context;
+  const { run, policy, source, destination, artifact } = context;
   const log: Logger = async (level, message, data) => {
     await store.update((db) => {
       db.logs.push({ id: id("log"), runId, level, message, data, createdAt: now() });
@@ -28,7 +28,7 @@ export async function verifyRestoreForRun(store: Store, runId: string, stagingRo
     const localArtifact = await downloadArtifact(destination, artifact, verifyDir, log, await getMicrosoftCredentials(store, String(destination.config.microsoftIntegrationId ?? "")));
     await verifyChecksum(localArtifact, artifact, log);
     const checkedArtifacts = source.type === "postgres"
-      ? await verifyPostgresRestore(source, runId, localArtifact, log)
+      ? await verifyPostgresRestore(source, policy, runId, localArtifact, log)
       : await verifyMinioRestore(localArtifact, verifyDir, log);
     const verifiedAt = now();
     await store.update((db) => {
@@ -66,11 +66,12 @@ async function loadContext(store: Store, runId: string) {
   const run = db.runs.find((item) => item.id === runId);
   if (!run) throw new Error("Run not found");
   const source = db.sources.find((item) => item.id === run.sourceId);
+  const policy = db.policies.find((item) => item.id === run.policyId);
   const destination = db.destinations.find((item) => item.id === run.destinationId);
-  if (!source || !destination) throw new Error("Run source or destination not found");
+  if (!source || !policy || !destination) throw new Error("Run policy, source or destination not found");
   const artifact = db.artifacts.find((item) => item.runId === run.id && item.kind !== "manifest");
   if (!artifact) throw new Error("No restore artifact found for run");
-  return { run, source, destination, artifact };
+  return { run, policy, source, destination, artifact };
 }
 
 async function downloadArtifact(destination: Destination, artifact: BackupArtifact, verifyDir: string, log: Logger, microsoftCredentials?: any) {
@@ -109,8 +110,10 @@ async function verifyChecksum(localFile: string, artifact: BackupArtifact, log: 
   await log("info", "Downloaded artifact checksum verified", { checksumSha256, sizeBytes: info.size });
 }
 
-async function verifyPostgresRestore(source: Source, runId: string, localFile: string, log: Logger) {
+async function verifyPostgresRestore(source: Source, policy: any, runId: string, localFile: string, log: Logger) {
   const config = source.config as any;
+  const scope = resolvePolicyScope(source, policy);
+  if (scope.mode === "all") throw new Error("Automatic restore verification for PostgreSQL all-databases scope is not supported safely yet");
   const database = `snapvault_verify_${runId.replace(/[^a-zA-Z0-9_]/g, "_")}`.toLowerCase();
   const env = { PGPASSWORD: source.secrets.password ?? "" };
   await runCommand("dropdb", ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username), "--if-exists", database], env);
@@ -129,6 +132,14 @@ async function verifyPostgresRestore(source: Source, runId: string, localFile: s
     await runCommand("dropdb", ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username), "--if-exists", database], env);
     await log("info", "PostgreSQL temporary restore database removed", { database });
   }
+}
+
+function resolvePolicyScope(source: Source, policy: any) {
+  const scope = policy.sourceScope as any;
+  if (scope?.mode) return scope;
+  const config = source.config as any;
+  if (source.type === "postgres") return { mode: config.scope === "all" ? "all" : "single", database: config.database };
+  return { mode: config.scope === "all" ? "all" : "single", bucket: config.bucket, prefix: config.prefix ?? "" };
 }
 
 async function verifyMinioRestore(localFile: string, verifyDir: string, log: Logger) {

@@ -169,14 +169,16 @@ async function createPostgresDump(source: Source, policy: Policy, runDir: string
     return [out];
   }
   const config = source.config as any;
-  if (config.scope === "all") {
+  const scope = resolvePolicyScope(source, policy);
+  if (scope.mode === "all") {
     const result = await runCommand("pg_dumpall", ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username)], { PGPASSWORD: source.secrets.password ?? "" });
     if (result.code !== 0) throw new Error(result.stderr || "pg_dumpall failed");
     if (policy.options.compression === "gzip") await pipeline(Readable.from([result.stdout]), createGzip(), createWriteStream(out));
     else await writeFile(out, result.stdout);
     return [out];
   }
-  const args = ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username), String(config.database)];
+  if (!scope.database) throw new Error("PostgreSQL backup routine has no database selected");
+  const args = ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username), String(scope.database)];
   const result = await runCommand("pg_dump", args, { PGPASSWORD: source.secrets.password ?? "" });
   if (result.code !== 0) throw new Error(result.stderr || "pg_dump failed");
   if (policy.options.compression === "gzip") {
@@ -196,19 +198,29 @@ async function createMinioSnapshot(source: Source, policy: Policy, runDir: strin
     return [out];
   }
   const config = source.config as any;
+  const scope = resolvePolicyScope(source, policy);
   const alias = `snapvault-${source.id}-${Date.now()}`;
   const objectDir = join(runDir, "objects");
   await mkdir(objectDir, { recursive: true });
   const aliasResult = await runCommand("mc", ["alias", "set", alias, String(config.endpoint), source.secrets.accessKey ?? "", source.secrets.secretKey ?? ""]);
   if (aliasResult.code !== 0) throw new Error(aliasResult.stderr || "mc alias set failed");
-  const bucketPath = config.scope === "all" ? "" : [String(config.bucket), String(config.prefix ?? "").replace(/^\/+|\/+$/g, "")].filter(Boolean).join("/");
+  if (scope.mode !== "all" && !scope.bucket) throw new Error("MinIO backup routine has no bucket selected");
+  const bucketPath = scope.mode === "all" ? "" : [String(scope.bucket), String(scope.prefix ?? "").replace(/^\/+|\/+$/g, "")].filter(Boolean).join("/");
   const copyResult = await runCommand("mc", ["cp", "--recursive", `${alias}/${bucketPath}`, objectDir]);
   await runCommand("mc", ["alias", "remove", alias]);
   if (copyResult.code !== 0) throw new Error(copyResult.stderr || "mc copy failed");
   const tarResult = await runCommand("tar", ["-czf", out, "-C", objectDir, "."]);
   if (tarResult.code !== 0) throw new Error(tarResult.stderr || "tar failed");
-  await log("info", "MinIO snapshot created", { bucket: config.bucket, prefix: config.prefix ?? "" });
+  await log("info", "MinIO snapshot created", { bucket: scope.mode === "all" ? "all" : scope.bucket, prefix: scope.prefix ?? "" });
   return [out];
+}
+
+function resolvePolicyScope(source: Source, policy: Policy) {
+  const scope = policy.sourceScope as any;
+  if (scope?.mode) return scope;
+  const config = source.config as any;
+  if (source.type === "postgres") return { mode: config.scope === "all" ? "all" : "single", database: config.database };
+  return { mode: config.scope === "all" ? "all" : "single", bucket: config.bucket, prefix: config.prefix ?? "" };
 }
 
 async function writeManifest(run: BackupRun, source: Source, policy: Policy, files: string[], runDir: string) {

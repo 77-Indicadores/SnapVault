@@ -106,7 +106,6 @@ Request PostgreSQL:
   "config": {
     "host": "postgres",
     "port": 5432,
-    "database": "app",
     "username": "postgres"
   },
   "secrets": {
@@ -122,9 +121,7 @@ Request MinIO:
   "name": "App MinIO",
   "type": "minio",
   "config": {
-    "endpoint": "http://minio:9000",
-    "bucket": "uploads",
-    "prefix": ""
+    "endpoint": "http://minio:9000"
   },
   "secrets": {
     "accessKey": "key",
@@ -232,6 +229,10 @@ Request:
   "name": "Daily production database",
   "sourceId": "src_123",
   "destinationId": "dst_123",
+  "sourceScope": {
+    "mode": "single",
+    "database": "app"
+  },
   "schedule": {
     "type": "daily",
     "time": "02:00",
@@ -250,11 +251,13 @@ Request:
 }
 ```
 
+`sourceScope` pertence a rotina, nao a Source. Isso permite usar a mesma conexao PostgreSQL ou MinIO em varias rotinas, cada uma protegendo databases/buckets diferentes. Para MinIO, use `{ "mode": "single", "bucket": "uploads", "prefix": "optional/path" }`. Para todos os recursos acessiveis, use `{ "mode": "all" }`.
+
 `schedule.type` aceita `manual`, `daily`, `weekly` e `cron`. Rotinas `manual` nunca sao disparadas pelo scheduler.
 
 ### PATCH `/policies/:id`
 
-Edita `name`, `sourceId`, `destinationId`, `schedule`, `retention`, `options` e `enabled`. Nova origem e novo destino precisam estar `healthy`.
+Edita `name`, `sourceId`, `destinationId`, `sourceScope`, `schedule`, `retention`, `options` e `enabled`. Nova origem e novo destino precisam estar `healthy`.
 
 ### DELETE `/policies/:id`
 
@@ -295,7 +298,11 @@ Request:
 ```json
 {
   "artifactId": "art_123",
-  "targetSourceId": "src_restore_target"
+  "targetSourceId": "src_restore_target",
+  "targetScope": {
+    "mode": "single",
+    "database": "restore_target"
+  }
 }
 ```
 

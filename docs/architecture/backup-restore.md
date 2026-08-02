@@ -75,6 +75,8 @@ Modos:
 - `single`: usa `pg_dump` para um database.
 - `all`: usa `pg_dumpall` para todos os databases acessiveis pelo usuario.
 
+O database escolhido fica em `policy.sourceScope`, nao na Source. A Source guarda apenas host, porta, usuario e credencial.
+
 Limites:
 
 - Sem PITR no MVP.
@@ -106,6 +108,8 @@ Modos:
 
 O MVP deve priorizar `snapshot`, pois facilita auditoria e retencao.
 
+O bucket/prefixo escolhido fica em `policy.sourceScope`, nao na Source. A Source guarda apenas endpoint e credenciais.
+
 ## Restore
 
 ### PostgreSQL
@@ -123,6 +127,7 @@ Automatico:
 Manual:
 
 - Escolher uma Source PostgreSQL `healthy` com database unico.
+- Escolher o database alvo.
 - Baixar artefato do destino.
 - Aplicar `gzip -cd artifact | psql ... -d target_database`.
 
@@ -139,6 +144,7 @@ Automatico:
 Manual:
 
 - Escolher uma Source MinIO `healthy` com bucket unico.
+- Escolher o bucket/prefixo alvo.
 - Baixar artefato do destino.
 - Extrair e copiar para o bucket/prefixo alvo com `mc cp --recursive`.
 

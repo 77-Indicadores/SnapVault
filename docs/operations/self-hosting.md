@@ -78,20 +78,22 @@ PostgreSQL:
 - host;
 - porta;
 - usuario;
-- senha criptografada;
-- escopo: um database ou todos os databases acessiveis;
-- teste lista os databases disponiveis.
+- senha criptografada.
 
 MinIO:
 
 - endpoint;
 - access key;
-- secret key criptografada;
-- escopo: um bucket ou todos os buckets acessiveis;
-- prefixo opcional;
-- teste lista os buckets disponiveis.
+- secret key criptografada.
 
-O wizard de backup deve apenas combinar `Source healthy` com `Storage healthy`. Ele nao cria conexoes escondidas.
+O teste de Source lista databases PostgreSQL ou buckets MinIO apenas para provar permissao e alimentar os selects da rotina.
+
+O escopo do que proteger fica na rotina de backup, nao na Source:
+
+- PostgreSQL: um database ou todos os databases acessiveis;
+- MinIO: um bucket, um bucket/prefixo ou todos os buckets acessiveis.
+
+O wizard de backup combina `Source healthy` com `Storage healthy` e pergunta o escopo daquela rotina. A mesma Source pode ser reutilizada em varias rotinas com escopos diferentes.
 
 Sources com rotinas, runs ou artefatos vinculados devem ser arquivadas, nao apagadas. Arquivar uma Source pausa rotinas vinculadas e preserva historico/restore. Reativar volta como `untested`, exigindo novo teste.
 
@@ -111,10 +113,12 @@ Depois de cada backup verificado, o SnapVault tenta baixar o artefato do destino
 
 O restore manual pela interface exige escolher uma Source alvo `healthy` do mesmo tipo:
 
-- PostgreSQL: alvo com um database unico;
-- MinIO: alvo com um bucket unico.
+- PostgreSQL: escolher o database alvo no momento do restore;
+- MinIO: escolher o bucket/prefixo alvo no momento do restore.
 
 Essa restricao evita restaurar acidentalmente um backup amplo sobre um ambiente errado.
+
+Observacao de integridade: backups MinIO em modo `all` sao verificados por extracao do pacote. Backups PostgreSQL em modo `all` usam `pg_dumpall`; para marcar `recoverable` com seguranca sera necessario restaurar em um cluster PostgreSQL temporario isolado. Ate essa etapa, o modo mais confiavel para producao e criar rotinas por database.
 
 ## Migracao local
 

@@ -42,6 +42,12 @@ const policySchema = z.object({
   name: z.string().min(1),
   sourceId: z.string(),
   destinationId: z.string(),
+  sourceScope: z.object({
+    mode: z.enum(["single", "all"]),
+    database: z.string().optional(),
+    bucket: z.string().optional(),
+    prefix: z.string().optional()
+  }).optional(),
   schedule: z.object({
     type: z.enum(["manual", "daily", "weekly", "cron"]),
     cron: z.string().optional(),
@@ -82,6 +88,7 @@ const policyPatchSchema = z.object({
   name: z.string().min(1).optional(),
   sourceId: z.string().optional(),
   destinationId: z.string().optional(),
+  sourceScope: policySchema.shape.sourceScope,
   schedule: policySchema.shape.schedule.optional(),
   retention: policySchema.shape.retention.optional(),
   options: policySchema.shape.options.optional(),
@@ -472,6 +479,7 @@ app.post("/api/v1/policies", { preHandler: requireAuth }, async (request) => {
     const destination = db.destinations.find((item) => item.id === body.destinationId);
     if (!destination) throw new Error("Destination not found");
     if (destination.status !== "healthy") throw new Error("Destination must be tested and healthy before creating a backup routine");
+    validatePolicyScope(source, body.sourceScope);
     db.policies.push(policy);
   });
   return { policy };
@@ -491,6 +499,8 @@ app.patch("/api/v1/policies/:id", { preHandler: requireAuth }, async (request) =
       const destination = db.destinations.find((item) => item.id === body.destinationId);
       if (!destination || destination.status !== "healthy") throw new Error("Destination must be healthy");
     }
+    const source = db.sources.find((item) => item.id === (body.sourceId ?? target.sourceId));
+    if (source && body.sourceScope) validatePolicyScope(source, body.sourceScope);
     Object.assign(target, body, { updatedAt: now() });
     return target;
   });
@@ -566,7 +576,16 @@ app.post("/api/v1/restores/prepare", { preHandler: requireAuth }, async (request
 });
 
 app.post("/api/v1/restores/execute", { preHandler: requireAuth }, async (request) => {
-  const body = z.object({ artifactId: z.string(), targetSourceId: z.string() }).parse(request.body);
+  const body = z.object({
+    artifactId: z.string(),
+    targetSourceId: z.string(),
+    targetScope: z.object({
+      mode: z.enum(["single"]),
+      database: z.string().optional(),
+      bucket: z.string().optional(),
+      prefix: z.string().optional()
+    }).optional()
+  }).parse(request.body);
   const db = await store.read();
   const artifact = db.artifacts.find((item) => item.id === body.artifactId);
   const target = db.sources.find((item) => item.id === body.targetSourceId);
@@ -588,12 +607,25 @@ app.post("/api/v1/restores/execute", { preHandler: requireAuth }, async (request
     } else {
       throw new Error("Restore execution requires Microsoft Graph or local artifact");
     }
-    const result = target.type === "postgres" ? await restorePostgresArtifact(target as any, localFile) : await restoreMinioArtifact(target as any, localFile, restoreDir);
+    const result = target.type === "postgres" ? await restorePostgresArtifact(target as any, localFile, body.targetScope) : await restoreMinioArtifact(target as any, localFile, restoreDir, body.targetScope);
     return { restoreId: id("rst"), status: "completed", targetSourceId: target.id, result };
   } finally {
     await rm(restoreDir, { recursive: true, force: true });
   }
 });
+
+function validatePolicyScope(source: any, scope: any) {
+  const resolved = resolveSourceScope(source, scope);
+  if (source.type === "postgres" && resolved.mode !== "all" && !resolved.database) throw new Error("Choose a database for this PostgreSQL backup routine");
+  if (source.type === "minio" && resolved.mode !== "all" && !resolved.bucket) throw new Error("Choose a bucket for this MinIO backup routine");
+}
+
+function resolveSourceScope(source: any, scope?: any) {
+  const sourceConfig = source.config as any;
+  if (scope?.mode) return scope;
+  if (source.type === "postgres") return { mode: sourceConfig.scope === "all" ? "all" : "single", database: sourceConfig.database };
+  return { mode: sourceConfig.scope === "all" ? "all" : "single", bucket: sourceConfig.bucket, prefix: sourceConfig.prefix ?? "" };
+}
 
 async function createSession(reply: any, userId: string) {
   const session = { id: id("sess"), userId, createdAt: now(), expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 14).toISOString() };
@@ -649,9 +681,7 @@ async function testPostgresSource(source: any) {
   if (result.code !== 0) throw new Error(result.stderr || "PostgreSQL connection failed");
   const databases = result.stdout.split("\n").map((item) => item.trim()).filter(Boolean);
   if (!databases.length) throw new Error("No accessible PostgreSQL databases found");
-  const selected = String(sourceConfig.database ?? "");
-  if (sourceConfig.scope !== "all" && selected && !databases.includes(selected)) throw new Error(`Database not found or not accessible: ${selected}`);
-  return { status: "healthy", kind: "postgres", resources: { databases }, selected: sourceConfig.scope === "all" ? "all" : selected || databases[0] };
+  return { status: "healthy", kind: "postgres", resources: { databases }, selected: databases[0] };
 }
 
 async function testMinioSource(source: any) {
@@ -666,26 +696,27 @@ async function testMinioSource(source: any) {
       try { return JSON.parse(line).key?.replace(/\/$/, ""); } catch { return ""; }
     }).filter(Boolean);
     if (!buckets.length) throw new Error("No accessible MinIO buckets found");
-    const selected = String(sourceConfig.bucket ?? "");
-    if (sourceConfig.scope !== "all" && selected && !buckets.includes(selected)) throw new Error(`Bucket not found or not accessible: ${selected}`);
-    return { status: "healthy", kind: "minio", resources: { buckets }, selected: sourceConfig.scope === "all" ? "all" : selected || buckets[0] };
+    return { status: "healthy", kind: "minio", resources: { buckets }, selected: buckets[0] };
   } finally {
     await runCommand("mc", ["alias", "remove", alias]);
   }
 }
 
-async function restorePostgresArtifact(source: any, localFile: string) {
+async function restorePostgresArtifact(source: any, localFile: string, scope?: any) {
   const sourceConfig = source.config as any;
-  if (sourceConfig.scope === "all") throw new Error("Manual PostgreSQL restore requires a single target database");
+  const database = String(scope?.database ?? sourceConfig.database ?? "");
+  if (!database) throw new Error("Manual PostgreSQL restore requires a target database");
   const env = { PGPASSWORD: source.secrets?.password ?? "" };
-  const restore = await runCommand("sh", ["-lc", `gzip -cd "$1" | psql -h "$2" -p "$3" -U "$4" -d "$5"`, "sh", localFile, String(sourceConfig.host), String(sourceConfig.port ?? 5432), String(sourceConfig.username), String(sourceConfig.database)], env);
+  const restore = await runCommand("sh", ["-lc", `gzip -cd "$1" | psql -h "$2" -p "$3" -U "$4" -d "$5"`, "sh", localFile, String(sourceConfig.host), String(sourceConfig.port ?? 5432), String(sourceConfig.username), database], env);
   if (restore.code !== 0) throw new Error(restore.stderr || "PostgreSQL restore failed");
-  return { type: "postgres", database: sourceConfig.database };
+  return { type: "postgres", database };
 }
 
-async function restoreMinioArtifact(source: any, localFile: string, restoreDir: string) {
+async function restoreMinioArtifact(source: any, localFile: string, restoreDir: string, scope?: any) {
   const sourceConfig = source.config as any;
-  if (sourceConfig.scope === "all") throw new Error("Manual MinIO restore requires a single target bucket");
+  const bucket = String(scope?.bucket ?? sourceConfig.bucket ?? "");
+  const prefix = String(scope?.prefix ?? sourceConfig.prefix ?? "");
+  if (!bucket) throw new Error("Manual MinIO restore requires a target bucket");
   const extractDir = join(restoreDir, "objects");
   await mkdir(extractDir, { recursive: true });
   const tar = await runCommand("tar", ["-xzf", localFile, "-C", extractDir]);
@@ -694,10 +725,10 @@ async function restoreMinioArtifact(source: any, localFile: string, restoreDir: 
   const aliasResult = await runCommand("mc", ["alias", "set", alias, String(sourceConfig.endpoint), source.secrets?.accessKey ?? "", source.secrets?.secretKey ?? ""]);
   if (aliasResult.code !== 0) throw new Error(aliasResult.stderr || "MinIO connection failed");
   try {
-    const target = [String(sourceConfig.bucket), String(sourceConfig.prefix ?? "").replace(/^\/+|\/+$/g, "")].filter(Boolean).join("/");
+    const target = [bucket, prefix.replace(/^\/+|\/+$/g, "")].filter(Boolean).join("/");
     const copy = await runCommand("mc", ["cp", "--recursive", extractDir, `${alias}/${target}`]);
     if (copy.code !== 0) throw new Error(copy.stderr || "MinIO restore copy failed");
-    return { type: "minio", bucket: sourceConfig.bucket, prefix: sourceConfig.prefix ?? "" };
+    return { type: "minio", bucket, prefix };
   } finally {
     await runCommand("mc", ["alias", "remove", alias]);
   }

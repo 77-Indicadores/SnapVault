@@ -3,6 +3,12 @@ export type SourceType = "postgres" | "minio";
 export type DestinationType = "onedrive" | "sharepoint" | "s3" | "azure_blob" | "google_drive" | "dropbox" | "b2" | "wasabi" | "ftp" | "sftp";
 export type ResourceStatus = "untested" | "healthy" | "failed" | "archived";
 export type RunStatus = "queued" | "running" | "success" | "verified" | "recoverable" | "restore_failed" | "failed" | "cancelled";
+export type SourceScope = {
+  mode: "single" | "all";
+  database?: string;
+  bucket?: string;
+  prefix?: string;
+};
 
 export type User = {
   id: string;
@@ -65,6 +71,7 @@ export type Policy = {
   name: string;
   sourceId: string;
   destinationId: string;
+  sourceScope?: SourceScope;
   schedule: {
     type: "manual" | "daily" | "weekly" | "cron";
     cron?: string;
