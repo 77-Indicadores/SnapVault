@@ -11,9 +11,22 @@
 7. Criptografar quando aplicavel.
 8. Enviar para destino.
 9. Verificar upload quando configurado.
-10. Aplicar retencao.
-11. Limpar staging.
-12. Atualizar status.
+10. Baixar o artefato remoto.
+11. Validar checksum do arquivo baixado.
+12. Executar teste automatico de restore.
+13. Marcar a run como `recoverable` quando o restore temporario passar.
+14. Aplicar retencao preservando sempre o ultimo `recoverable`.
+15. Limpar staging.
+16. Atualizar status.
+
+## Estados da execucao
+
+- `queued`: aguardando execucao.
+- `running`: backup em andamento.
+- `verified`: artefato gerado, enviado e checksum validado.
+- `recoverable`: restore automatico validado.
+- `failed`: backup falhou antes de ficar confiavel.
+- `restore_failed`: artefato existe, mas o teste automatico de restore falhou.
 
 ## Manifesto
 
@@ -57,11 +70,16 @@ Formato de nome:
 {basePath}/{sourceName}/{yyyy}/{mm}/{dd}/{runId}/dump.sql.gz
 ```
 
+Modos:
+
+- `single`: usa `pg_dump` para um database.
+- `all`: usa `pg_dumpall` para todos os databases acessiveis pelo usuario.
+
 Limites:
 
 - Sem PITR no MVP.
 - Sem backup incremental nativo no MVP.
-- Restore inicial gera arquivo e comando recomendado.
+- Restore manual executavel exige alvo `single`, para evitar restaurar um dump de cluster sobre ambientes errados.
 
 ## PostgreSQL futuro
 
@@ -92,25 +110,43 @@ O MVP deve priorizar `snapshot`, pois facilita auditoria e retencao.
 
 ### PostgreSQL
 
-MVP:
+Automatico:
 
 - Baixar artefato.
 - Validar checksum.
-- Descriptografar e descomprimir quando necessario.
-- Entregar caminho local e comando sugerido:
+- Descomprimir.
+- Restaurar em banco temporario `snapvault_verify_<runId>`.
+- Validar que o restore terminou sem erro.
+- Validar presenca de objetos no banco temporario.
+- Remover banco temporario.
 
-```bash
-psql "$DATABASE_URL" < dump.sql
-```
+Manual:
+
+- Escolher uma Source PostgreSQL `healthy` com database unico.
+- Baixar artefato do destino.
+- Aplicar `gzip -cd artifact | psql ... -d target_database`.
 
 ### MinIO
 
-MVP:
+Automatico:
 
 - Baixar artefato.
 - Validar checksum.
 - Extrair para diretorio local.
-- Opcionalmente enviar para bucket/prefixo alternativo.
+- Validar que o pacote abre e contem arquivos.
+- Remover diretorio temporario.
+
+Manual:
+
+- Escolher uma Source MinIO `healthy` com bucket unico.
+- Baixar artefato do destino.
+- Extrair e copiar para o bucket/prefixo alvo com `mc cp --recursive`.
+
+## Scheduler
+
+O processo da API possui scheduler simples no MVP. A cada minuto ele avalia rotinas `enabled` com `schedule.type` `daily` ou `weekly`, cria uma run `scheduled` e dispara o mesmo pipeline usado pelo botao `Executar agora`.
+
+Horarios sao comparados em UTC no scheduler atual. A UI mostra e envia o horario explicitamente; suporte completo a timezones nomeados fica para uma etapa posterior.
 
 ## Retencao
 

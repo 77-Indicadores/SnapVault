@@ -43,12 +43,13 @@ type DestinationType = "sharepoint" | "onedrive";
 type Frequency = "manual" | "daily" | "weekly";
 type Source = { id: string; name: string; type: SourceType | string; status: string; config?: any; metadata?: any; lastTestedAt?: string | null };
 type Destination = { id: string; name: string; type: DestinationType | string; status: string; basePath: string; config?: any; metadata?: any; lastTestedAt?: string | null };
-type BackupRoutine = { id: string; name: string; sourceId: string; destinationId: string; enabled: boolean; schedule?: { type: string; time?: string; timezone?: string }; retention?: { keepLast: number; keepDays: number } };
+type BackupRoutine = { id: string; name: string; sourceId: string; destinationId: string; enabled: boolean; schedule?: { type: string; time?: string; weekday?: number; timezone?: string }; retention?: { keepLast: number; keepDays: number } };
 type Run = { id: string; policyId: string; sourceId?: string; destinationId?: string; status: string; verificationStatus?: string; verifiedAt?: string | null; createdAt: string; bytesWritten: number | null; errorMessage: string | null };
 type Artifact = { id: string; kind: string; path: string; sizeBytes: number | null; checksumSha256: string | null };
 type RunDetail = { run: Run; logs: Array<{ message: string; level: string; createdAt: string }>; artifacts: Artifact[] };
 type AppData = { sources: Source[]; destinations: Destination[]; policies: BackupRoutine[]; runs: Run[] };
 type Notice = { tone: "success" | "error"; text: string } | null;
+type RestoreRequest = { runId: string; artifact: Artifact; sourceType: string };
 type MicrosoftSite = { id: string; displayName?: string; name?: string; webUrl?: string };
 type MicrosoftDrive = { id: string; name: string; webUrl?: string; quota?: any };
 type MicrosoftUser = { id: string; displayName?: string; mail?: string; userPrincipalName?: string };
@@ -68,6 +69,8 @@ function App() {
   const [editingStorage, setEditingStorage] = useState<Destination | null>(null);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [selectedPolicyId, setSelectedPolicyId] = useState("");
+  const [editingPolicy, setEditingPolicy] = useState<BackupRoutine | null>(null);
+  const [restoreRequest, setRestoreRequest] = useState<RestoreRequest | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -152,7 +155,7 @@ function App() {
     <AppShell user={user} view={view} setView={setView} onNewBackup={() => setWizardOpen(true)}>
       {notice && <div className={`toast ${notice.tone}`}>{notice.text}</div>}
       {view === "overview" && <OverviewPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onRunOpen={setSelectedRunId} onPolicyOpen={(id) => { setSelectedPolicyId(id); setView("backups"); }} busy={busy} />}
-      {view === "backups" && (selectedPolicyId ? <BackupDetailPage data={data} policyId={selectedPolicyId} onBack={() => setSelectedPolicyId("")} onRun={runNow} onRunOpen={setSelectedRunId} onToggle={togglePolicy} refresh={refresh} showNotice={showNotice} busy={busy} /> : <BackupsPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onRunOpen={setSelectedRunId} onPolicyOpen={setSelectedPolicyId} onToggle={togglePolicy} onDelete={deletePolicy} busy={busy} />)}
+      {view === "backups" && (selectedPolicyId ? <BackupDetailPage data={data} policyId={selectedPolicyId} onBack={() => setSelectedPolicyId("")} onRun={runNow} onRunOpen={setSelectedRunId} onEdit={setEditingPolicy} onRestore={setRestoreRequest} onToggle={togglePolicy} refresh={refresh} showNotice={showNotice} busy={busy} /> : <BackupsPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onRunOpen={setSelectedRunId} onPolicyOpen={setSelectedPolicyId} onEdit={setEditingPolicy} onToggle={togglePolicy} onDelete={deletePolicy} busy={busy} />)}
       {view === "sources" && <SourcesPage data={data} refresh={refresh} openCreate={() => setSourceOpen(true)} openEdit={setEditingSource} showNotice={showNotice} />}
       {view === "storage" && <StoragePage data={data} refresh={refresh} openCreate={() => setStorageOpen(true)} openEdit={setEditingStorage} showNotice={showNotice} />}
       {view === "settings" && <SettingsPage user={user} onLogout={logout} showNotice={showNotice} />}
@@ -161,6 +164,8 @@ function App() {
       {editingSource && <SourceWizard source={editingSource} onClose={() => setEditingSource(null)} onDone={async () => { setEditingSource(null); await refresh(); showNotice({ tone: "success", text: "Origem atualizada." }); }} />}
       {storageOpen && <StorageWizard onClose={() => setStorageOpen(false)} onDone={async () => { setStorageOpen(false); await refresh(); showNotice({ tone: "success", text: "Armazenamento conectado e testado." }); }} />}
       {editingStorage && <StorageWizard destination={editingStorage} onClose={() => setEditingStorage(null)} onDone={async () => { setEditingStorage(null); await refresh(); showNotice({ tone: "success", text: "Armazenamento atualizado." }); }} />}
+      {editingPolicy && <PolicyWizard data={data} policy={editingPolicy} onClose={() => setEditingPolicy(null)} onDone={async () => { setEditingPolicy(null); await refresh(); showNotice({ tone: "success", text: "Rotina atualizada." }); }} />}
+      {restoreRequest && <RestoreExecuteModal data={data} request={restoreRequest} onClose={() => setRestoreRequest(null)} onDone={async () => { setRestoreRequest(null); await refresh(); showNotice({ tone: "success", text: "Restore executado com sucesso." }); }} />}
       {selectedRunId && <RunDetailModal runId={selectedRunId} onClose={() => setSelectedRunId("")} />}
     </AppShell>
   );
@@ -219,7 +224,7 @@ function OverviewPage({ data, onNewBackup, onRun, onRunOpen, onPolicyOpen, busy 
   );
 }
 
-function BackupsPage(props: { data: AppData; onNewBackup: () => void; onRun: (id: string) => void; onRunOpen: (id: string) => void; onPolicyOpen: (id: string) => void; onToggle: (policy: BackupRoutine) => void; onDelete: (id: string) => void; busy: string }) {
+function BackupsPage(props: { data: AppData; onNewBackup: () => void; onRun: (id: string) => void; onRunOpen: (id: string) => void; onPolicyOpen: (id: string) => void; onEdit: (policy: BackupRoutine) => void; onToggle: (policy: BackupRoutine) => void; onDelete: (id: string) => void; busy: string }) {
   return (
     <>
       <PageTitle eyebrow="Backups" title="Rotinas de backup" text="Cada rotina define o que proteger, onde salvar e quando executar." />
@@ -230,7 +235,7 @@ function BackupsPage(props: { data: AppData; onNewBackup: () => void; onRun: (id
   );
 }
 
-function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onToggle, refresh, showNotice, busy }: { data: AppData; policyId: string; onBack: () => void; onRun: (id: string) => void; onRunOpen: (id: string) => void; onToggle: (policy: BackupRoutine) => void; refresh: () => Promise<void>; showNotice: (notice: Notice) => void; busy: string }) {
+function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onEdit, onRestore, onToggle, refresh, showNotice, busy }: { data: AppData; policyId: string; onBack: () => void; onRun: (id: string) => void; onRunOpen: (id: string) => void; onEdit: (policy: BackupRoutine) => void; onRestore: (request: RestoreRequest) => void; onToggle: (policy: BackupRoutine) => void; refresh: () => Promise<void>; showNotice: (notice: Notice) => void; busy: string }) {
   const [restoreBusy, setRestoreBusy] = useState("");
   const [testBusy, setTestBusy] = useState("");
   const policy = data.policies.find((item) => item.id === policyId);
@@ -249,9 +254,7 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onToggle, 
       const detail: RunDetail = await api(`/runs/${runId}`);
       if (!detail.artifacts.length) throw new Error("Esta execucao nao possui artefatos.");
       const artifact = detail.artifacts.find((item) => item.kind !== "manifest") ?? detail.artifacts[0];
-      const result = await api("/restores/prepare", { method: "POST", body: JSON.stringify({ artifactId: artifact.id }) });
-      showNotice({ tone: "success", text: `Recuperacao preparada para ${result.restore.sourceType}.` });
-      onRunOpen(runId);
+      onRestore({ runId, artifact, sourceType: source?.type ?? String(detail.run.sourceId ?? "") });
     } catch (err: any) {
       showNotice({ tone: "error", text: err.message });
     } finally {
@@ -283,6 +286,7 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onToggle, 
           <p>{source?.type ?? "origem"} para {destination?.type ?? "armazenamento"} · {policy.enabled ? "ativo" : "pausado"}</p>
         </div>
         <div className="detailActions">
+          <button className="secondaryButton" onClick={() => onEdit(policy)}><Pencil size={15} /> Editar</button>
           <button className="secondaryButton" disabled={busy === policy.id} onClick={() => onToggle(policy)}><Pause size={15} /> {policy.enabled ? "Pausar" : "Ativar"}</button>
           <button className="primaryButton" disabled={busy === policy.id} onClick={() => onRun(policy.id)}>{busy === policy.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />} Executar agora</button>
         </div>
@@ -399,15 +403,18 @@ function SourcesPage({ data, refresh, openCreate, openEdit, showNotice }: { data
     }
   };
   const deleteSource = async (source: Source) => {
-    if (dependencyCount(source.id) > 0) {
-      showNotice({ tone: "error", text: "Origem com backups vinculados nao pode ser apagada." });
-      return;
-    }
     setBusy(source.id);
     try {
-      await api(`/sources/${source.id}`, { method: "DELETE" });
+      const deps = dependencyCount(source.id);
+      if (source.status === "archived") {
+        await api(`/sources/${source.id}/reactivate`, { method: "POST", body: "{}" });
+      } else if (deps > 0) {
+        await api(`/sources/${source.id}/archive`, { method: "POST", body: "{}" });
+      } else {
+        await api(`/sources/${source.id}`, { method: "DELETE" });
+      }
       await refresh();
-      showNotice({ tone: "success", text: "Origem removida." });
+      showNotice({ tone: "success", text: source.status === "archived" ? "Origem reativada. Teste antes de usar." : deps > 0 ? "Origem arquivada e rotinas vinculadas pausadas." : "Origem removida." });
     } catch (err: any) {
       showNotice({ tone: "error", text: err.message });
     } finally {
@@ -421,7 +428,9 @@ function SourcesPage({ data, refresh, openCreate, openEdit, showNotice }: { data
         {!data.sources.length ? <EmptyState title="Nenhuma origem" text="Conecte PostgreSQL ou MinIO antes de criar uma rotina." /> : (
           <div className="itemList">{data.sources.map((source) => {
             const scope = source.config?.scope === "all" ? "todos" : source.type === "postgres" ? source.config?.database : source.config?.bucket;
-            return <article className="listItem" key={source.id}><div className="itemMain"><strong>{source.name}</strong><span>{source.type} · {scope || "escopo nao definido"}</span></div><StatusBadge status={source.status} /><div className="rowActions"><button className="secondaryButton small" disabled={busy === source.id} onClick={() => testSource(source.id)}>{busy === source.id ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} Testar</button><button className="secondaryButton small" onClick={() => openEdit(source)}><Pencil size={14} /> Editar</button><button className="secondaryButton small" disabled={busy === source.id} onClick={() => deleteSource(source)}><Trash2 size={14} /> Excluir</button></div></article>;
+            const deps = dependencyCount(source.id);
+            const actionText = source.status === "archived" ? "Reativar" : deps > 0 ? "Arquivar" : "Excluir";
+            return <article className="listItem" key={source.id}><div className="itemMain"><strong>{source.name}</strong><span>{source.type} · {scope || "escopo nao definido"}</span></div><StatusBadge status={source.status} /><div className="rowActions"><button className="secondaryButton small" disabled={busy === source.id || source.status === "archived"} onClick={() => testSource(source.id)}>{busy === source.id ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} Testar</button><button className="secondaryButton small" onClick={() => openEdit(source)}><Pencil size={14} /> Editar</button><button className="secondaryButton small" disabled={busy === source.id} onClick={() => deleteSource(source)}>{source.status === "archived" ? <RefreshCw size={14} /> : <Trash2 size={14} />} {actionText}</button></div></article>;
           })}</div>
         )}
       </section>
@@ -473,46 +482,6 @@ function RestorePage({ data, onRunOpen, showNotice }: { data: AppData; onRunOpen
 }
 
 function SettingsPage({ user, onLogout, showNotice }: { user: any; onLogout: () => void; showNotice: (notice: Notice) => void }) {
-  const [msConfig, setMsConfig] = useState<any>(null);
-  const [tenantId, setTenantId] = useState("");
-  const [clientId, setClientId] = useState("");
-  const [clientSecret, setClientSecret] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState("");
-  useEffect(() => {
-    api("/integrations/microsoft/config").then((config) => {
-      setMsConfig(config);
-      setTenantId(config.tenantId ?? "");
-      setClientId(config.clientId ?? "");
-    }).finally(() => setLoading(false));
-  }, []);
-  const save = async () => {
-    setBusy("save");
-    try {
-      const payload: any = { tenantId, clientId };
-      if (clientSecret) payload.clientSecret = clientSecret;
-      const saved = await api("/integrations/microsoft/config", { method: "PUT", body: JSON.stringify(payload) });
-      setMsConfig(saved);
-      setClientSecret("");
-      showNotice({ tone: "success", text: "Integração Microsoft salva." });
-    } catch (err: any) {
-      showNotice({ tone: "error", text: err.message });
-    } finally {
-      setBusy("");
-    }
-  };
-  const test = async () => {
-    setBusy("test");
-    try {
-      const result = await api("/integrations/microsoft/test", { method: "POST", body: "{}" });
-      setMsConfig(result.config);
-      showNotice({ tone: "success", text: "Microsoft Graph conectado." });
-    } catch (err: any) {
-      showNotice({ tone: "error", text: err.message });
-    } finally {
-      setBusy("");
-    }
-  };
   return (
     <>
       <PageTitle eyebrow="Settings" title="Configuracoes" text="Estado da instalacao self-hosted, sessao e integracoes operacionais." action={<button className="secondaryButton" onClick={onLogout}><LogOut size={15} /> Sair</button>} />
@@ -521,21 +490,6 @@ function SettingsPage({ user, onLogout, showNotice }: { user: any; onLogout: () 
         <InfoCard title="Operacao" rows={[["Ambiente", "self-hosted"], ["Segredos", "criptografados localmente"], ["Interface", "sem expor secret salvo"]]} />
       </section>
       <MicrosoftIntegrationsPanel showNotice={showNotice} />
-      <section className="sectionBlock settingsPanel">
-        <SectionHeader title="Integracao Microsoft" action={<StatusBadge status={msConfig?.status ?? "untested"} />} />
-        <div className="formGrid">
-          <Field label="Tenant ID"><input value={tenantId} onChange={(e) => setTenantId(e.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" /></Field>
-          <Field label="Client ID"><input value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="Application client id" /></Field>
-          <Field label={msConfig?.clientSecretSet ? "Client Secret novo opcional" : "Client Secret"}><input type="password" value={clientSecret} onChange={(e) => setClientSecret(e.target.value)} placeholder={msConfig?.clientSecretSet ? "secret salvo; preencha para trocar" : "cole o secret uma vez"} /></Field>
-        </div>
-        <div className="settingsHint">
-          {loading ? "Carregando configuracao..." : msConfig?.clientSecretSet ? `Secret salvo. Ultimo teste: ${msConfig.lastTestedAt ? formatDate(msConfig.lastTestedAt) : "ainda nao testado"}.` : "Configure as credenciais do App Microsoft para listar sites, bibliotecas e salvar backups."}
-        </div>
-        <div className="footerActions">
-          <button className="secondaryButton" disabled={busy === "test" || !tenantId || !clientId} onClick={test}>{busy === "test" ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />} Testar conexao</button>
-          <button className="primaryButton" disabled={busy === "save" || !tenantId || !clientId || (!clientSecret && !msConfig?.clientSecretSet)} onClick={save}>{busy === "save" ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Salvar</button>
-        </div>
-      </section>
     </>
   );
 }
@@ -639,7 +593,7 @@ function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDon
       if (!sourceId) throw new Error("Conecte e teste uma origem antes de criar a rotina.");
       let destinationId = selectedDestinationId;
       if (!destinationId) throw new Error("Conecte e teste um armazenamento antes de criar a rotina.");
-      const schedule = frequency === "manual" ? { type: "daily", time: "02:00", timezone: "America/Sao_Paulo" } : { type: frequency, time: "02:00", timezone: "America/Sao_Paulo" };
+      const schedule = frequency === "manual" ? { type: "manual", timezone: "America/Sao_Paulo" } : { type: frequency, time: "02:00", timezone: "America/Sao_Paulo" };
       const policy = await api("/policies", { method: "POST", body: JSON.stringify({ name: routineName, sourceId, destinationId, schedule, retention: { keepLast, keepDays }, options: { compression: "gzip", encryption: false, verifyAfterUpload: true }, enabled: true }) });
       const run = await api(`/policies/${policy.policy.id}/run`, { method: "POST", body: "{}" });
       onDone(run.runId);
@@ -914,6 +868,87 @@ function StorageWizard({ destination, onClose, onDone }: { destination?: Destina
   );
 }
 
+function PolicyWizard({ data, policy, onClose, onDone }: { data: AppData; policy: BackupRoutine; onClose: () => void; onDone: () => void }) {
+  const [name, setName] = useState(policy.name);
+  const [sourceId, setSourceId] = useState(policy.sourceId);
+  const [destinationId, setDestinationId] = useState(policy.destinationId);
+  const [frequency, setFrequency] = useState<Frequency>((policy.schedule?.type as Frequency) ?? "daily");
+  const [time, setTime] = useState(policy.schedule?.time ?? "02:00");
+  const [weekday, setWeekday] = useState(Number(policy.schedule?.weekday ?? 0));
+  const [keepLast, setKeepLast] = useState(policy.retention?.keepLast ?? 7);
+  const [keepDays, setKeepDays] = useState(policy.retention?.keepDays ?? 30);
+  const [enabled, setEnabled] = useState(policy.enabled);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const healthySources = data.sources.filter((item) => item.status === "healthy" || item.id === policy.sourceId);
+  const healthyDestinations = data.destinations.filter((item) => item.status === "healthy" || item.id === policy.destinationId);
+  const save = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const schedule = frequency === "manual" ? { type: "manual", timezone: "America/Sao_Paulo" } : { type: frequency, time, weekday, timezone: "America/Sao_Paulo" };
+      await api(`/policies/${policy.id}`, { method: "PATCH", body: JSON.stringify({ name, sourceId, destinationId, schedule, retention: { keepLast, keepDays }, enabled }) });
+      onDone();
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Editar rotina">
+      <div className="wizard compactWizard">
+        <header className="wizardHeader"><div><span>Backup</span><h2>Editar rotina</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
+        <ChoiceGrid>
+          <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} /></Field>
+          <Field label="O que proteger"><select value={sourceId} onChange={(e) => setSourceId(e.target.value)}>{healthySources.map((item) => <option key={item.id} value={item.id}>{item.name} - {item.type}</option>)}</select></Field>
+          <Field label="Onde salvar"><select value={destinationId} onChange={(e) => setDestinationId(e.target.value)}>{healthyDestinations.map((item) => <option key={item.id} value={item.id}>{item.name} - {item.basePath}</option>)}</select></Field>
+          <Field label="Frequencia"><select value={frequency} onChange={(e) => setFrequency(e.target.value as Frequency)}><option value="manual">Manual</option><option value="daily">Diario</option><option value="weekly">Semanal</option></select></Field>
+          {frequency !== "manual" && <div className="fieldPair"><Field label="Horario UTC"><input type="time" value={time} onChange={(e) => setTime(e.target.value)} /></Field><Field label="Dia semanal"><select value={weekday} onChange={(e) => setWeekday(Number(e.target.value))} disabled={frequency !== "weekly"}><option value={0}>Domingo</option><option value={1}>Segunda</option><option value={2}>Terca</option><option value={3}>Quarta</option><option value={4}>Quinta</option><option value={5}>Sexta</option><option value={6}>Sabado</option></select></Field></div>}
+          <div className="fieldPair"><Field label="Manter no minimo"><input type="number" min={1} value={keepLast} onChange={(e) => setKeepLast(Math.max(1, Number(e.target.value)))} /></Field><Field label="Apagar apos dias"><input type="number" min={0} value={keepDays} onChange={(e) => setKeepDays(Math.max(0, Number(e.target.value)))} /></Field></div>
+          <Field label="Estado"><select value={enabled ? "enabled" : "paused"} onChange={(e) => setEnabled(e.target.value === "enabled")}><option value="enabled">Ativa</option><option value="paused">Pausada</option></select></Field>
+        </ChoiceGrid>
+        {error && <p className="formError">{error}</p>}
+        <footer className="wizardFooter"><button className="secondaryButton" onClick={onClose}>Cancelar</button><button className="primaryButton" disabled={busy} onClick={save}>{busy ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Salvar</button></footer>
+      </div>
+    </div>
+  );
+}
+
+function RestoreExecuteModal({ data, request, onClose, onDone }: { data: AppData; request: RestoreRequest; onClose: () => void; onDone: () => void }) {
+  const targets = data.sources.filter((source) => source.type === request.sourceType && source.status === "healthy" && source.config?.scope !== "all");
+  const [targetSourceId, setTargetSourceId] = useState(targets[0]?.id ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const execute = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api("/restores/execute", { method: "POST", body: JSON.stringify({ artifactId: request.artifact.id, targetSourceId }) });
+      onDone();
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Executar restore">
+      <div className="wizard compactWizard">
+        <header className="wizardHeader"><div><span>Restore</span><h2>Recuperar backup</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
+        <div className="reviewBox">
+          <ReviewRow label="Execucao" value={request.runId} />
+          <ReviewRow label="Artefato" value={request.artifact.path.split(/[\\/]/).pop() ?? request.artifact.kind} />
+          <ReviewRow label="Tamanho" value={formatBytes(request.artifact.sizeBytes)} />
+        </div>
+        {!targets.length ? <EmptyState compact title="Sem destino compativel" text="Crie e teste uma origem saudavel do mesmo tipo, com database ou bucket unico, para executar restore." /> : <ChoiceGrid><Field label="Restaurar em"><select value={targetSourceId} onChange={(e) => setTargetSourceId(e.target.value)}>{targets.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}</select></Field></ChoiceGrid>}
+        {error && <p className="formError">{error}</p>}
+        <footer className="wizardFooter"><button className="secondaryButton" onClick={onClose}>Cancelar</button><button className="primaryButton" disabled={busy || !targetSourceId} onClick={execute}>{busy ? <Loader2 className="spin" size={15} /> : <RotateCcw size={15} />} Executar restore</button></footer>
+      </div>
+    </div>
+  );
+}
+
 function RunDetailModal({ runId, onClose }: { runId: string; onClose: () => void }) {
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [error, setError] = useState("");
@@ -984,7 +1019,7 @@ function SetupChecklist({ data, onNewBackup }: { data: AppData; onNewBackup: () 
   return <section className="card"><SectionHeader title="Proximos passos" /><div className="checkList">{items.map(([label, done]) => <div className="checkItem" key={label}><span className={done ? "done" : ""}>{done ? <Check size={13} /> : null}</span>{label}</div>)}</div><button className="secondaryButton full" onClick={onNewBackup}>Configurar backup</button></section>;
 }
 
-function BackupList({ data, onRun, onPolicyOpen, busy, limit, onToggle, onDelete }: { data: AppData; onRun: (id: string) => void; onRunOpen: (id: string) => void; onPolicyOpen: (id: string) => void; busy: string; limit?: number; onToggle?: (policy: BackupRoutine) => void; onDelete?: (id: string) => void }) {
+function BackupList({ data, onRun, onPolicyOpen, onEdit, busy, limit, onToggle, onDelete }: { data: AppData; onRun: (id: string) => void; onRunOpen: (id: string) => void; onPolicyOpen: (id: string) => void; onEdit?: (policy: BackupRoutine) => void; busy: string; limit?: number; onToggle?: (policy: BackupRoutine) => void; onDelete?: (id: string) => void }) {
   const items = limit ? data.policies.slice(0, limit) : data.policies;
   if (!items.length) return <EmptyState title="Nenhum backup automatico" text="Crie seu primeiro backup para proteger PostgreSQL ou MinIO." />;
   return (
@@ -1002,6 +1037,7 @@ function BackupList({ data, onRun, onPolicyOpen, busy, limit, onToggle, onDelete
             <StatusBadge status={policy.enabled ? lastRun?.status ?? "ready" : "paused"} />
             <div className="rowActions">
               <button className="secondaryButton small" disabled={busy === policy.id} onClick={() => onRun(policy.id)}>{busy === policy.id ? <Loader2 className="spin" size={14} /> : <Play size={14} />} Rodar</button>
+              {onEdit && <button className="secondaryButton small" disabled={busy === policy.id} onClick={() => onEdit(policy)}><Pencil size={14} /> Editar</button>}
               {onToggle && <button className="secondaryButton small" disabled={busy === policy.id} onClick={() => onToggle(policy)}><Pause size={14} /> {policy.enabled ? "Pausar" : "Ativar"}</button>}
               {onDelete && <button className="iconOnly danger" disabled={busy === policy.id} onClick={() => onDelete(policy.id)} aria-label="Remover backup"><Trash2 size={15} /></button>}
             </div>

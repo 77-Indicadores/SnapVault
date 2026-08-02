@@ -93,6 +93,29 @@ MinIO:
 
 O wizard de backup deve apenas combinar `Source healthy` com `Storage healthy`. Ele nao cria conexoes escondidas.
 
+Sources com rotinas, runs ou artefatos vinculados devem ser arquivadas, nao apagadas. Arquivar uma Source pausa rotinas vinculadas e preserva historico/restore. Reativar volta como `untested`, exigindo novo teste.
+
+## Agendamento
+
+Rotinas podem ser:
+
+- `manual`: nunca rodam sozinhas;
+- `daily`: rodam uma vez por dia no horario definido;
+- `weekly`: rodam no dia da semana e horario definidos.
+
+No MVP, o scheduler roda dentro da API e compara horario em UTC. Em producao, configure o horario pensando no UTC ate o suporte completo a timezones nomeados entrar.
+
+## Restore
+
+Depois de cada backup verificado, o SnapVault tenta baixar o artefato do destino, validar checksum e executar restore temporario. Apenas runs com esse teste aprovado ficam `recoverable`.
+
+O restore manual pela interface exige escolher uma Source alvo `healthy` do mesmo tipo:
+
+- PostgreSQL: alvo com um database unico;
+- MinIO: alvo com um bucket unico.
+
+Essa restricao evita restaurar acidentalmente um backup amplo sobre um ambiente errado.
+
 ## Migracao local
 
 Instalacoes antigas que tinham `settings.microsoft` singleton sao migradas automaticamente para `microsoftIntegrations[]` na leitura do banco local. Destinos Microsoft antigos passam a apontar para a primeira integracao migrada. Sources antigas com runs `recoverable` sao preservadas como saudaveis para nao bloquear rotinas ja validadas.

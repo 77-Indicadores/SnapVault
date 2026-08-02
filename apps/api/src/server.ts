@@ -3,6 +3,8 @@ import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import bcrypt from "bcryptjs";
 import { basename } from "node:path";
+import { mkdir, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { z } from "zod";
 import { config } from "./config.js";
 import { decryptText, encryptText } from "./crypto.js";
@@ -15,6 +17,7 @@ import { runCommand } from "./runner.js";
 
 const store = new Store(config.databasePath);
 const app = Fastify({ logger: true });
+const scheduledKeys = new Set<string>();
 
 await app.register(cors, { origin: config.webOrigin, credentials: true });
 await app.register(cookie, { secret: config.cookieSecret });
@@ -40,7 +43,7 @@ const policySchema = z.object({
   sourceId: z.string(),
   destinationId: z.string(),
   schedule: z.object({
-    type: z.enum(["daily", "weekly", "cron"]),
+    type: z.enum(["manual", "daily", "weekly", "cron"]),
     cron: z.string().optional(),
     time: z.string().optional(),
     weekday: z.number().optional(),
@@ -77,6 +80,11 @@ const microsoftConfigSchema = z.object({
 
 const policyPatchSchema = z.object({
   name: z.string().min(1).optional(),
+  sourceId: z.string().optional(),
+  destinationId: z.string().optional(),
+  schedule: policySchema.shape.schedule.optional(),
+  retention: policySchema.shape.retention.optional(),
+  options: policySchema.shape.options.optional(),
   enabled: z.boolean().optional()
 });
 
@@ -333,9 +341,38 @@ app.delete("/api/v1/sources/:id", { preHandler: requireAuth }, async (request) =
   const params = z.object({ id: z.string() }).parse(request.params);
   await store.update((db) => {
     if (db.policies.some((item) => item.sourceId === params.id)) throw new Error("Source is used by a backup routine");
+    if (db.runs.some((item) => item.sourceId === params.id) || db.artifacts.some((item) => item.sourceId === params.id)) throw new Error("Source has backup history; archive it instead");
     db.sources = db.sources.filter((item) => item.id !== params.id);
   });
   return { ok: true };
+});
+
+app.post("/api/v1/sources/:id/archive", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const source = await store.update((db) => {
+    const target = db.sources.find((item) => item.id === params.id);
+    if (!target) throw new Error("Source not found");
+    target.status = "archived";
+    target.updatedAt = now();
+    for (const policy of db.policies.filter((item) => item.sourceId === params.id)) {
+      policy.enabled = false;
+      policy.updatedAt = now();
+    }
+    return withoutSecrets(target);
+  });
+  return { source };
+});
+
+app.post("/api/v1/sources/:id/reactivate", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const source = await store.update((db) => {
+    const target = db.sources.find((item) => item.id === params.id);
+    if (!target) throw new Error("Source not found");
+    target.status = "untested";
+    target.updatedAt = now();
+    return withoutSecrets(target);
+  });
+  return { source };
 });
 
 app.get("/api/v1/destinations", { preHandler: requireAuth }, async () => {
@@ -446,6 +483,14 @@ app.patch("/api/v1/policies/:id", { preHandler: requireAuth }, async (request) =
   const policy = await store.update((db) => {
     const target = db.policies.find((item) => item.id === params.id);
     if (!target) throw new Error("Policy not found");
+    if (body.sourceId) {
+      const source = db.sources.find((item) => item.id === body.sourceId);
+      if (!source || source.status !== "healthy") throw new Error("Source must be healthy");
+    }
+    if (body.destinationId) {
+      const destination = db.destinations.find((item) => item.id === body.destinationId);
+      if (!destination || destination.status !== "healthy") throw new Error("Destination must be healthy");
+    }
     Object.assign(target, body, { updatedAt: now() });
     return target;
   });
@@ -518,6 +563,36 @@ app.post("/api/v1/restores/prepare", { preHandler: requireAuth }, async (request
       instructions: command
     }
   };
+});
+
+app.post("/api/v1/restores/execute", { preHandler: requireAuth }, async (request) => {
+  const body = z.object({ artifactId: z.string(), targetSourceId: z.string() }).parse(request.body);
+  const db = await store.read();
+  const artifact = db.artifacts.find((item) => item.id === body.artifactId);
+  const target = db.sources.find((item) => item.id === body.targetSourceId);
+  if (!artifact) throw new Error("Artifact not found");
+  if (!target) throw new Error("Target source not found");
+  if (target.status !== "healthy") throw new Error("Target source must be healthy");
+  const run = db.runs.find((item) => item.id === artifact.runId);
+  const destination = run ? db.destinations.find((item) => item.id === run.destinationId) : null;
+  if (!destination) throw new Error("Artifact destination not found");
+  const restoreDir = join(config.stagingDir, "manual-restores", id("rst"));
+  await mkdir(restoreDir, { recursive: true });
+  try {
+    const localFile = join(restoreDir, basename(artifact.path));
+    if ((destination.type === "sharepoint" || destination.type === "onedrive") && destination.config.mode === "graph") {
+      const { downloadMicrosoftDrivePath } = await import("./microsoftGraph.js");
+      await downloadMicrosoftDrivePath(destination.config as any, artifact.path, localFile, await microsoftCredentials(String(destination.config.microsoftIntegrationId ?? "")));
+    } else if (artifact.path.startsWith("/")) {
+      await runCommand("cp", [artifact.path, localFile]);
+    } else {
+      throw new Error("Restore execution requires Microsoft Graph or local artifact");
+    }
+    const result = target.type === "postgres" ? await restorePostgresArtifact(target as any, localFile) : await restoreMinioArtifact(target as any, localFile, restoreDir);
+    return { restoreId: id("rst"), status: "completed", targetSourceId: target.id, result };
+  } finally {
+    await rm(restoreDir, { recursive: true, force: true });
+  }
 });
 
 async function createSession(reply: any, userId: string) {
@@ -599,6 +674,35 @@ async function testMinioSource(source: any) {
   }
 }
 
+async function restorePostgresArtifact(source: any, localFile: string) {
+  const sourceConfig = source.config as any;
+  if (sourceConfig.scope === "all") throw new Error("Manual PostgreSQL restore requires a single target database");
+  const env = { PGPASSWORD: source.secrets?.password ?? "" };
+  const restore = await runCommand("sh", ["-lc", `gzip -cd "$1" | psql -h "$2" -p "$3" -U "$4" -d "$5"`, "sh", localFile, String(sourceConfig.host), String(sourceConfig.port ?? 5432), String(sourceConfig.username), String(sourceConfig.database)], env);
+  if (restore.code !== 0) throw new Error(restore.stderr || "PostgreSQL restore failed");
+  return { type: "postgres", database: sourceConfig.database };
+}
+
+async function restoreMinioArtifact(source: any, localFile: string, restoreDir: string) {
+  const sourceConfig = source.config as any;
+  if (sourceConfig.scope === "all") throw new Error("Manual MinIO restore requires a single target bucket");
+  const extractDir = join(restoreDir, "objects");
+  await mkdir(extractDir, { recursive: true });
+  const tar = await runCommand("tar", ["-xzf", localFile, "-C", extractDir]);
+  if (tar.code !== 0) throw new Error(tar.stderr || "MinIO artifact extraction failed");
+  const alias = `snapvault-restore-${source.id}-${Date.now()}`;
+  const aliasResult = await runCommand("mc", ["alias", "set", alias, String(sourceConfig.endpoint), source.secrets?.accessKey ?? "", source.secrets?.secretKey ?? ""]);
+  if (aliasResult.code !== 0) throw new Error(aliasResult.stderr || "MinIO connection failed");
+  try {
+    const target = [String(sourceConfig.bucket), String(sourceConfig.prefix ?? "").replace(/^\/+|\/+$/g, "")].filter(Boolean).join("/");
+    const copy = await runCommand("mc", ["cp", "--recursive", extractDir, `${alias}/${target}`]);
+    if (copy.code !== 0) throw new Error(copy.stderr || "MinIO restore copy failed");
+    return { type: "minio", bucket: sourceConfig.bucket, prefix: sourceConfig.prefix ?? "" };
+  } finally {
+    await runCommand("mc", ["alias", "remove", alias]);
+  }
+}
+
 async function microsoftCredentials(integrationId?: string) {
   const db = await store.read();
   const saved = integrationId
@@ -611,4 +715,37 @@ async function microsoftCredentials(integrationId?: string) {
   throw new Error("Microsoft credentials are not configured");
 }
 
+function startScheduler() {
+  setInterval(async () => {
+    try {
+      const db = await store.read();
+      const current = new Date();
+      const hhmm = current.toISOString().slice(11, 16);
+      const weekday = current.getUTCDay();
+      for (const policy of db.policies) {
+        if (!policy.enabled || policy.schedule.type === "manual" || policy.schedule.type === "cron") continue;
+        const wantedTime = policy.schedule.time ?? "02:00";
+        if (wantedTime !== hhmm) continue;
+        if (policy.schedule.type === "weekly" && Number(policy.schedule.weekday ?? 0) !== weekday) continue;
+        const key = `${policy.id}:${current.toISOString().slice(0, 16)}`;
+        if (scheduledKeys.has(key)) continue;
+        scheduledKeys.add(key);
+        const source = db.sources.find((item) => item.id === policy.sourceId);
+        const destination = db.destinations.find((item) => item.id === policy.destinationId);
+        if (source?.status !== "healthy" || destination?.status !== "healthy") continue;
+        const run = await store.update((next) => {
+          const created: any = { id: id("run"), policyId: policy.id, sourceId: policy.sourceId, destinationId: policy.destinationId, trigger: "scheduled", status: "queued", startedAt: null, finishedAt: null, durationMs: null, bytesWritten: null, errorCode: null, errorMessage: null, verificationStatus: "not_checked", verifiedAt: null, createdAt: now() };
+          next.runs.push(created);
+          return created;
+        });
+        void executeBackupRun(store, run.id, config.stagingDir);
+      }
+      if (scheduledKeys.size > 5000) scheduledKeys.clear();
+    } catch (error) {
+      app.log.error(error);
+    }
+  }, 60_000);
+}
+
 await app.listen({ host: config.host, port: config.port });
+startScheduler();

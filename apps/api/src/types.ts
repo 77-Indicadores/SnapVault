@@ -66,7 +66,7 @@ export type Policy = {
   sourceId: string;
   destinationId: string;
   schedule: {
-    type: "daily" | "weekly" | "cron";
+    type: "manual" | "daily" | "weekly" | "cron";
     cron?: string;
     time?: string;
     weekday?: number;

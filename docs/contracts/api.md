@@ -146,6 +146,22 @@ Resposta:
 }
 ```
 
+### PATCH `/sources/:id`
+
+Edita nome, config e secrets. Quando secrets mudam, a origem volta para `untested` ate novo teste.
+
+### DELETE `/sources/:id`
+
+Remove apenas origem sem rotinas, runs ou artefatos vinculados. A requisicao nao precisa enviar body.
+
+### POST `/sources/:id/archive`
+
+Arquiva origem com historico e pausa rotinas vinculadas. Origem arquivada nao entra em novas rotinas.
+
+### POST `/sources/:id/reactivate`
+
+Reativa origem arquivada como `untested`. Ela precisa ser testada antes de ser usada.
+
 ## Destinations
 
 ### GET `/destinations`
@@ -185,6 +201,22 @@ Request SharePoint:
 
 Testa escrita, leitura e remocao de arquivo temporario.
 
+### PATCH `/destinations/:id`
+
+Edita nome, pasta base, config e metadata.
+
+### DELETE `/destinations/:id`
+
+Remove apenas destino sem rotinas, runs ou artefatos vinculados. Destino com historico deve ser arquivado.
+
+### POST `/destinations/:id/archive`
+
+Arquiva destino e pausa rotinas vinculadas.
+
+### POST `/destinations/:id/reactivate`
+
+Reativa destino como `untested`.
+
 ## Policies
 
 ### GET `/policies`
@@ -215,6 +247,69 @@ Request:
     "verifyAfterUpload": true
   },
   "enabled": true
+}
+```
+
+`schedule.type` aceita `manual`, `daily`, `weekly` e `cron`. Rotinas `manual` nunca sao disparadas pelo scheduler.
+
+### PATCH `/policies/:id`
+
+Edita `name`, `sourceId`, `destinationId`, `schedule`, `retention`, `options` e `enabled`. Nova origem e novo destino precisam estar `healthy`.
+
+### DELETE `/policies/:id`
+
+Remove a rotina. Runs e artefatos antigos continuam no historico.
+
+### POST `/policies/:id/run`
+
+Cria uma execucao manual da rotina.
+
+## Restore
+
+### POST `/runs/:id/test-restore`
+
+Executa a mesma verificacao de restore usada automaticamente apos o backup.
+
+Resposta:
+
+```json
+{
+  "runId": "run_123",
+  "status": "recoverable",
+  "verificationStatus": "restore_verified",
+  "checkedArtifacts": 12,
+  "message": "Restore automatico validado"
+}
+```
+
+### POST `/restores/prepare`
+
+Retorna artefato e comando sugerido, sem executar escrita em destino.
+
+### POST `/restores/execute`
+
+Executa restore manual em uma origem alvo saudavel do mesmo tipo.
+
+Request:
+
+```json
+{
+  "artifactId": "art_123",
+  "targetSourceId": "src_restore_target"
+}
+```
+
+Resposta:
+
+```json
+{
+  "restoreId": "rst_123",
+  "status": "completed",
+  "targetSourceId": "src_restore_target",
+  "result": {
+    "type": "postgres",
+    "database": "restore_target"
+  }
 }
 ```
 
