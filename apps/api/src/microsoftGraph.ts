@@ -1,6 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { open, readFile, stat } from "node:fs/promises";
 import { basename } from "node:path";
-import { writeFile } from "node:fs/promises";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { createHash } from "node:crypto";
 import { config } from "./config.js";
 
@@ -22,6 +24,14 @@ export type MicrosoftCredentials = {
   tenantId: string;
   clientId: string;
   clientSecret: string;
+};
+
+type UploadProgress = {
+  uploadedBytes: number;
+  sizeBytes: number;
+  chunkIndex: number;
+  totalChunks: number;
+  chunkSize: number;
 };
 
 export async function getMicrosoftToken(credentials: MicrosoftCredentials = config.microsoft) {
@@ -49,19 +59,30 @@ export async function microsoftCredentialStatus(credentials: MicrosoftCredential
   return { ok: true, tokenType: "Bearer", tokenPresent: token.length > 0 };
 }
 
-export async function uploadToMicrosoftDrive(destinationConfig: MicrosoftDestinationConfig, basePath: string, localFile: string, remotePath: string, credentials?: MicrosoftCredentials) {
+export async function uploadToMicrosoftDrive(
+  destinationConfig: MicrosoftDestinationConfig,
+  basePath: string,
+  localFile: string,
+  remotePath: string,
+  credentials?: MicrosoftCredentials,
+  onProgress?: (progress: UploadProgress) => Promise<void> | void
+) {
   const token = await getMicrosoftToken(credentials);
   const target = await resolveDrive(token, destinationConfig);
   const cleanBase = basePath.replace(/^\/+|\/+$/g, "");
   const cleanRemote = remotePath.replace(/^\/+|\/+$/g, "");
   const uploadPath = [cleanBase, cleanRemote, basename(localFile)].filter(Boolean).join("/");
+  const fileInfo = await stat(localFile);
+  if (fileInfo.size > 4 * 1024 * 1024) {
+    return uploadLargeFileToMicrosoftDrive(token, target, uploadPath, localFile, fileInfo.size, onProgress);
+  }
   const bytes = await readFile(localFile);
   const response = await graphFetch(token, `https://graph.microsoft.com/v1.0/drives/${target.driveId}/root:/${encodePath(uploadPath)}:/content`, {
     method: "PUT",
     body: bytes
   });
   const data = await response.json();
-  return { id: data.id as string, name: data.name as string, webUrl: data.webUrl as string, path: uploadPath, drive: target };
+  return { id: data.id as string, name: data.name as string, webUrl: data.webUrl as string, path: uploadPath, drive: target, uploadMode: "simple", sizeBytes: fileInfo.size, chunkSize: null };
 }
 
 export async function deleteMicrosoftDrivePath(destinationConfig: MicrosoftDestinationConfig, path: string, credentials?: MicrosoftCredentials) {
@@ -86,9 +107,10 @@ export async function downloadMicrosoftDrivePath(destinationConfig: MicrosoftDes
   const target = await resolveDrive(token, destinationConfig);
   const cleanPath = path.replace(/^\/+|\/+$/g, "");
   const response = await graphFetch(token, `https://graph.microsoft.com/v1.0/drives/${target.driveId}/root:/${encodePath(cleanPath)}:/content`);
-  const bytes = Buffer.from(await response.arrayBuffer());
-  await writeFile(localFile, bytes);
-  return { path: cleanPath, localFile, sizeBytes: bytes.length, drive: target };
+  if (!response.body) throw new Error("Microsoft Graph download returned an empty body");
+  await pipeline(Readable.fromWeb(response.body as any), createWriteStream(localFile));
+  const info = await stat(localFile);
+  return { path: cleanPath, localFile, sizeBytes: info.size, drive: target };
 }
 
 export async function testMicrosoftDestination(destinationConfig: MicrosoftDestinationConfig, basePath: string, credentials?: MicrosoftCredentials) {
@@ -175,6 +197,62 @@ async function graphFetch(token: string, url: string, init: RequestInit = {}) {
     throw new Error(data.error?.message ?? `Microsoft Graph request failed with ${response.status}`);
   }
   return response;
+}
+
+async function uploadLargeFileToMicrosoftDrive(
+  token: string,
+  target: GraphDriveTarget,
+  uploadPath: string,
+  localFile: string,
+  sizeBytes: number,
+  onProgress?: (progress: UploadProgress) => Promise<void> | void
+) {
+  const sessionResponse = await graphFetch(token, `https://graph.microsoft.com/v1.0/drives/${target.driveId}/root:/${encodePath(uploadPath)}:/createUploadSession`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      item: {
+        "@microsoft.graph.conflictBehavior": "replace",
+        name: basename(localFile)
+      }
+    })
+  });
+  const session = await sessionResponse.json();
+  if (!session.uploadUrl) throw new Error("Microsoft Graph upload session did not return uploadUrl");
+  const chunkSize = 10 * 1024 * 1024;
+  const totalChunks = Math.ceil(sizeBytes / chunkSize);
+  const handle = await open(localFile, "r");
+  try {
+    let offset = 0;
+    let chunkIndex = 0;
+    let lastResponse: any = null;
+    while (offset < sizeBytes) {
+      chunkIndex += 1;
+      const remaining = sizeBytes - offset;
+      const length = Math.min(chunkSize, remaining);
+      const buffer = Buffer.allocUnsafe(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, offset);
+      if (bytesRead <= 0) throw new Error("Unexpected end of file during Microsoft Graph upload");
+      const start = offset;
+      const end = offset + bytesRead - 1;
+      const response = await fetch(session.uploadUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Length": String(bytesRead),
+          "Content-Range": `bytes ${start}-${end}/${sizeBytes}`
+        },
+        body: buffer.subarray(0, bytesRead)
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error?.message ?? `Microsoft Graph chunk upload failed with ${response.status}`);
+      lastResponse = data;
+      offset += bytesRead;
+      await onProgress?.({ uploadedBytes: offset, sizeBytes, chunkIndex, totalChunks, chunkSize });
+    }
+    return { id: lastResponse.id as string, name: lastResponse.name as string, webUrl: lastResponse.webUrl as string, path: uploadPath, drive: target, uploadMode: "session", sizeBytes, chunkSize };
+  } finally {
+    await handle.close();
+  }
 }
 
 function encodePath(path: string) {

@@ -110,6 +110,15 @@ O MVP deve priorizar `snapshot`, pois facilita auditoria e retencao.
 
 O bucket/prefixo escolhido fica em `policy.sourceScope`, nao na Source. A Source guarda apenas endpoint e credenciais.
 
+## Microsoft Graph e arquivos grandes
+
+Uploads para OneDrive/SharePoint usam dois caminhos:
+
+- upload simples para arquivos pequenos;
+- `createUploadSession` com chunks de 10 MiB para artefatos grandes.
+
+Downloads de artefatos para verificacao de restore sao feitos por streaming para arquivo local, evitando carregar arquivos grandes inteiros em memoria.
+
 ## Restore
 
 ### PostgreSQL
