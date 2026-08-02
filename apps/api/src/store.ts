@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import type { Database } from "./types.js";
 
 const emptyDb = (): Database => ({
+  settings: { microsoft: null },
   users: [],
   sessions: [],
   sources: [],
@@ -51,4 +52,20 @@ export const publicUser = (user: Database["users"][number]) => ({
 export const withoutSecrets = <T extends { secrets?: Record<string, string> }>(entity: T) => {
   const { secrets, ...rest } = entity;
   return rest;
+};
+
+export const publicMicrosoftConfig = (settings: Database["settings"]) => {
+  const microsoft = settings?.microsoft;
+  if (!microsoft) {
+    return { configured: false, tenantId: "", clientId: "", clientSecretSet: false, status: "untested", lastTestedAt: null };
+  }
+  return {
+    configured: true,
+    tenantId: microsoft.tenantId,
+    clientId: microsoft.clientId,
+    clientSecretSet: Boolean(microsoft.encryptedClientSecret),
+    status: microsoft.status,
+    lastTestedAt: microsoft.lastTestedAt,
+    updatedAt: microsoft.updatedAt
+  };
 };

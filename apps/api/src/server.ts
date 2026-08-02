@@ -5,10 +5,11 @@ import bcrypt from "bcryptjs";
 import { basename } from "node:path";
 import { z } from "zod";
 import { config } from "./config.js";
+import { decryptText, encryptText } from "./crypto.js";
 import { id, now } from "./ids.js";
-import { publicUser, Store, withoutSecrets } from "./store.js";
+import { publicMicrosoftConfig, publicUser, Store, withoutSecrets } from "./store.js";
 import { executeBackupRun } from "./backup.js";
-import { listMicrosoftSiteDrives, listMicrosoftSites, listMicrosoftUsers, microsoftCredentialStatus, testMicrosoftDestination } from "./microsoftGraph.js";
+import { getMicrosoftDriveQuota, listMicrosoftSiteDrives, listMicrosoftSites, listMicrosoftUsers, microsoftCredentialStatus, testMicrosoftDestination } from "./microsoftGraph.js";
 import { verifyRestoreForRun } from "./restoreVerify.js";
 
 const store = new Store(config.databasePath);
@@ -29,6 +30,7 @@ const destinationSchema = z.object({
   type: z.enum(["onedrive", "sharepoint", "s3", "azure_blob", "google_drive", "dropbox", "b2", "wasabi", "ftp", "sftp"]),
   basePath: z.string().default("/SnapVault"),
   config: z.record(z.unknown()),
+  metadata: z.record(z.unknown()).optional(),
   secrets: z.record(z.string()).default({})
 });
 
@@ -58,7 +60,15 @@ const sourcePatchSchema = z.object({
 
 const destinationPatchSchema = z.object({
   name: z.string().min(1).optional(),
-  basePath: z.string().min(1).optional()
+  basePath: z.string().min(1).optional(),
+  config: z.record(z.unknown()).optional(),
+  metadata: z.record(z.unknown()).optional()
+});
+
+const microsoftConfigSchema = z.object({
+  tenantId: z.string().min(1),
+  clientId: z.string().min(1),
+  clientSecret: z.string().min(1).optional()
 });
 
 const policyPatchSchema = z.object({
@@ -117,12 +127,70 @@ app.post("/api/v1/auth/logout", async (request, reply) => {
 
 app.get("/api/v1/auth/me", { preHandler: requireAuth }, async (request) => ({ user: publicUser((request as any).user) }));
 
-app.get("/api/v1/integrations/microsoft/status", { preHandler: requireAuth }, async () => microsoftCredentialStatus());
-app.get("/api/v1/integrations/microsoft/users", { preHandler: requireAuth }, async () => listMicrosoftUsers());
-app.get("/api/v1/integrations/microsoft/sites", { preHandler: requireAuth }, async () => listMicrosoftSites());
+app.get("/api/v1/integrations/microsoft/config", { preHandler: requireAuth }, async () => {
+  const db = await store.read();
+  const saved = publicMicrosoftConfig(db.settings);
+  if (saved.configured) return saved;
+  return {
+    ...saved,
+    configured: Boolean(config.microsoft.tenantId && config.microsoft.clientId && config.microsoft.clientSecret),
+    tenantId: config.microsoft.tenantId,
+    clientId: config.microsoft.clientId,
+    clientSecretSet: Boolean(config.microsoft.clientSecret),
+    source: config.microsoft.clientSecret ? "env" : "none"
+  };
+});
+
+app.put("/api/v1/integrations/microsoft/config", { preHandler: requireAuth }, async (request) => {
+  const body = microsoftConfigSchema.parse(request.body);
+  const saved = await store.update((db) => {
+    const previous = db.settings?.microsoft;
+    const clientSecret = body.clientSecret
+      ? body.clientSecret
+      : previous?.encryptedClientSecret
+        ? decryptText(previous.encryptedClientSecret, config.cookieSecret)
+        : config.microsoft.clientSecret;
+    if (!clientSecret) throw new Error("Client secret is required");
+    const stamp = now();
+    db.settings = db.settings ?? {};
+    db.settings.microsoft = {
+      tenantId: body.tenantId,
+      clientId: body.clientId,
+      encryptedClientSecret: encryptText(clientSecret, config.cookieSecret),
+      status: "untested",
+      lastTestedAt: previous?.lastTestedAt ?? null,
+      createdAt: previous?.createdAt ?? stamp,
+      updatedAt: stamp
+    };
+    return publicMicrosoftConfig(db.settings);
+  });
+  return saved;
+});
+
+app.post("/api/v1/integrations/microsoft/test", { preHandler: requireAuth }, async () => {
+  const credentials = await microsoftCredentials();
+  const result = await microsoftCredentialStatus(credentials);
+  const updated = await store.update((db) => {
+    if (db.settings?.microsoft) {
+      db.settings.microsoft.status = "healthy";
+      db.settings.microsoft.lastTestedAt = now();
+      db.settings.microsoft.updatedAt = now();
+    }
+    return publicMicrosoftConfig(db.settings);
+  });
+  return { ...result, config: updated };
+});
+
+app.get("/api/v1/integrations/microsoft/status", { preHandler: requireAuth }, async () => microsoftCredentialStatus(await microsoftCredentials()));
+app.get("/api/v1/integrations/microsoft/users", { preHandler: requireAuth }, async () => listMicrosoftUsers(await microsoftCredentials()));
+app.get("/api/v1/integrations/microsoft/sites", { preHandler: requireAuth }, async () => listMicrosoftSites(await microsoftCredentials()));
 app.get("/api/v1/integrations/microsoft/site-drives", { preHandler: requireAuth }, async (request) => {
   const query = z.object({ siteId: z.string() }).parse(request.query);
-  return listMicrosoftSiteDrives(query.siteId);
+  return listMicrosoftSiteDrives(query.siteId, await microsoftCredentials());
+});
+app.get("/api/v1/integrations/microsoft/drive-quota", { preHandler: requireAuth }, async (request) => {
+  const query = z.object({ driveId: z.string() }).parse(request.query);
+  return getMicrosoftDriveQuota(query.driveId, await microsoftCredentials());
 });
 
 app.get("/api/v1/sources", { preHandler: requireAuth }, async () => {
@@ -186,9 +254,10 @@ app.post("/api/v1/destinations/:id/test", { preHandler: requireAuth }, async (re
   const db = await store.read();
   const destination = db.destinations.find((item) => item.id === params.id);
   if (!destination) throw new Error("destination not found");
+  if (destination.status === "archived") throw new Error("Archived storage cannot be tested until it is reactivated");
   if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
-    const result = await testMicrosoftDestination(destination.config as any, destination.basePath);
-    await markResource("destination", params.id);
+    const result = await testMicrosoftDestination(destination.config as any, destination.basePath, await microsoftCredentials());
+    await markResource("destination", params.id, { quota: result.quota, checked: result.checked, drive: result.drive });
     return result;
   }
   return markResource("destination", params.id);
@@ -210,9 +279,40 @@ app.delete("/api/v1/destinations/:id", { preHandler: requireAuth }, async (reque
   const params = z.object({ id: z.string() }).parse(request.params);
   await store.update((db) => {
     if (db.policies.some((item) => item.destinationId === params.id)) throw new Error("Destination is used by a backup routine");
+    if (db.runs.some((item) => item.destinationId === params.id) || db.artifacts.some((item) => item.destinationId === params.id)) throw new Error("Destination has backup history; archive it instead");
     db.destinations = db.destinations.filter((item) => item.id !== params.id);
   });
   return { ok: true };
+});
+
+app.post("/api/v1/destinations/:id/archive", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const destination = await store.update((db) => {
+    const target = db.destinations.find((item) => item.id === params.id);
+    if (!target) throw new Error("Destination not found");
+    target.status = "archived";
+    target.archivedAt = now();
+    target.updatedAt = now();
+    for (const policy of db.policies.filter((item) => item.destinationId === params.id)) {
+      policy.enabled = false;
+      policy.updatedAt = now();
+    }
+    return withoutSecrets(target);
+  });
+  return { destination };
+});
+
+app.post("/api/v1/destinations/:id/reactivate", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const destination = await store.update((db) => {
+    const target = db.destinations.find((item) => item.id === params.id);
+    if (!target) throw new Error("Destination not found");
+    target.status = "untested";
+    target.archivedAt = null;
+    target.updatedAt = now();
+    return withoutSecrets(target);
+  });
+  return { destination };
 });
 
 app.get("/api/v1/policies", { preHandler: requireAuth }, async () => {
@@ -226,7 +326,9 @@ app.post("/api/v1/policies", { preHandler: requireAuth }, async (request) => {
   const policy = { id: id("pol"), ...body, createdAt: created, updatedAt: created };
   await store.update((db) => {
     if (!db.sources.some((item) => item.id === body.sourceId)) throw new Error("Source not found");
-    if (!db.destinations.some((item) => item.id === body.destinationId)) throw new Error("Destination not found");
+    const destination = db.destinations.find((item) => item.id === body.destinationId);
+    if (!destination) throw new Error("Destination not found");
+    if (destination.status !== "healthy") throw new Error("Destination must be tested and healthy before creating a backup routine");
     db.policies.push(policy);
   });
   return { policy };
@@ -257,6 +359,9 @@ app.post("/api/v1/policies/:id/run", { preHandler: requireAuth }, async (request
   const run = await store.update((db) => {
     const policy = db.policies.find((item) => item.id === params.id);
     if (!policy) throw new Error("Policy not found");
+    const destination = db.destinations.find((item) => item.id === policy.destinationId);
+    if (!destination) throw new Error("Destination not found");
+    if (destination.status !== "healthy") throw new Error("Destination must be healthy before running a backup");
     const created: any = { id: id("run"), policyId: policy.id, sourceId: policy.sourceId, destinationId: policy.destinationId, trigger: "manual", status: "queued", startedAt: null, finishedAt: null, durationMs: null, bytesWritten: null, errorCode: null, errorMessage: null, verificationStatus: "not_checked", verifiedAt: null, createdAt: now() };
     db.runs.push(created);
     return created;
@@ -324,7 +429,7 @@ async function requireAuth(request: any, reply: any) {
   request.user = user;
 }
 
-async function markResource(kind: "source" | "destination", resourceId: string) {
+async function markResource(kind: "source" | "destination", resourceId: string, metadata?: Record<string, unknown>) {
   const updated = await store.update((db) => {
     const collection = kind === "source" ? db.sources : db.destinations;
     const target = collection.find((item) => item.id === resourceId);
@@ -332,9 +437,20 @@ async function markResource(kind: "source" | "destination", resourceId: string) 
     target.status = "healthy";
     target.lastTestedAt = now();
     target.updatedAt = now();
+    if (metadata && kind === "destination") (target as any).metadata = { ...((target as any).metadata ?? {}), ...metadata };
     return withoutSecrets(target);
   });
   return { status: "healthy", resource: updated };
+}
+
+async function microsoftCredentials() {
+  const db = await store.read();
+  const saved = db.settings?.microsoft;
+  if (saved?.tenantId && saved?.clientId && saved?.encryptedClientSecret) {
+    return { tenantId: saved.tenantId, clientId: saved.clientId, clientSecret: decryptText(saved.encryptedClientSecret, config.cookieSecret) };
+  }
+  if (config.microsoft.tenantId && config.microsoft.clientId && config.microsoft.clientSecret) return config.microsoft;
+  throw new Error("Microsoft credentials are not configured");
 }
 
 await app.listen({ host: config.host, port: config.port });

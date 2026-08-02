@@ -5,12 +5,13 @@ import { createGzip } from "node:zlib";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { Store } from "./store.js";
-import { sha256File } from "./crypto.js";
+import { decryptText, sha256File } from "./crypto.js";
 import { commandExists, runCommand } from "./runner.js";
 import { id, now } from "./ids.js";
 import type { BackupArtifact, BackupRun, Destination, JobLogEntry, Policy, Source } from "./types.js";
 import { deleteMicrosoftDrivePath, uploadToMicrosoftDrive } from "./microsoftGraph.js";
 import { verifyRestoreForRun } from "./restoreVerify.js";
+import { config } from "./config.js";
 
 type Logger = (level: JobLogEntry["level"], message: string, data?: Record<string, unknown>) => Promise<void>;
 
@@ -47,7 +48,7 @@ export async function executeBackupRun(store: Store, runId: string, stagingRoot:
     const produced = await createSourceArtifact(source, policy, runDir, log);
     await verifyLocalArtifacts(source, produced, log);
     const manifestPath = await writeManifest(run, source, policy, produced, runDir);
-    const uploaded = await uploadArtifacts(destination, source, run, [...produced, manifestPath], log);
+    const uploaded = await uploadArtifacts(destination, source, run, [...produced, manifestPath], log, getMicrosoftCredentials(db));
     const finishedAt = now();
     const totalBytes = uploaded.reduce((sum, item) => sum + (item.sizeBytes ?? 0), 0);
     await store.update((next) => {
@@ -76,7 +77,12 @@ export async function executeBackupRun(store: Store, runId: string, stagingRoot:
 }
 
 async function applyRetention(store: Store, policy: Policy, destination: Destination, log: Logger) {
+  if (destination.status === "archived") {
+    await log("warn", "Retention skipped because destination is archived");
+    return;
+  }
   const db = await store.read();
+  const microsoftCredentials = getMicrosoftCredentials(db);
   const keepLast = Math.max(1, policy.retention.keepLast);
   const keepDays = Math.max(0, policy.retention.keepDays);
   const policyRuns = db.runs
@@ -95,7 +101,7 @@ async function applyRetention(store: Store, policy: Policy, destination: Destina
   const deleteRunIds = new Set(deleteRuns.map((item) => item.id));
   const deleteArtifacts = db.artifacts.filter((item) => deleteRunIds.has(item.runId));
   for (const artifact of deleteArtifacts) {
-    await deleteArtifact(destination, artifact.path);
+    await deleteArtifact(destination, artifact.path, microsoftCredentials);
   }
   await store.update((next) => {
     next.artifacts = next.artifacts.filter((item) => !deleteRunIds.has(item.runId));
@@ -105,9 +111,9 @@ async function applyRetention(store: Store, policy: Policy, destination: Destina
   await log("info", "Retention cleanup applied", { keepLast, keepDays, deletedRuns: deleteRuns.length, deletedArtifacts: deleteArtifacts.length });
 }
 
-async function deleteArtifact(destination: Destination, path: string) {
+async function deleteArtifact(destination: Destination, path: string, microsoftCredentials?: any) {
   if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
-    await deleteMicrosoftDrivePath(destination.config as any, path);
+    await deleteMicrosoftDrivePath(destination.config as any, path, microsoftCredentials);
     return;
   }
   if (path.startsWith("/")) {
@@ -209,7 +215,7 @@ async function writeManifest(run: BackupRun, source: Source, policy: Policy, fil
   return manifest;
 }
 
-async function uploadArtifacts(destination: Destination, source: Source, run: BackupRun, files: string[], log: Logger): Promise<BackupArtifact[]> {
+async function uploadArtifacts(destination: Destination, source: Source, run: BackupRun, files: string[], log: Logger, microsoftCredentials?: any): Promise<BackupArtifact[]> {
   const base = String(destination.basePath || "SnapVault").replace(/^\/+|\/+$/g, "");
   const datedPrefix = `${slug(source.name)}/${new Date().toISOString().slice(0, 10).replaceAll("-", "/")}/${run.id}`;
   const hasRclone = await commandExists("rclone");
@@ -219,7 +225,7 @@ async function uploadArtifacts(destination: Destination, source: Source, run: Ba
     const remotePath = `${base}/${datedPrefix}/${name}`;
     let storedPath = file;
     if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
-      const uploaded = await uploadToMicrosoftDrive(destination.config as any, destination.basePath, file, datedPrefix);
+      const uploaded = await uploadToMicrosoftDrive(destination.config as any, destination.basePath, file, datedPrefix, microsoftCredentials);
       storedPath = uploaded.path;
       await log("info", "Uploaded artifact to Microsoft Graph", { path: uploaded.path, drive: uploaded.drive.label });
     } else if (hasRclone && destination.config.rcloneRemoteName) {
@@ -250,4 +256,13 @@ async function uploadArtifacts(destination: Destination, source: Source, run: Ba
     });
   }
   return records;
+}
+
+function getMicrosoftCredentials(db: any) {
+  const saved = db.settings?.microsoft;
+  if (saved?.tenantId && saved?.clientId && saved?.encryptedClientSecret) {
+    return { tenantId: saved.tenantId, clientId: saved.clientId, clientSecret: decryptText(saved.encryptedClientSecret, config.cookieSecret) };
+  }
+  if (config.microsoft.tenantId && config.microsoft.clientId && config.microsoft.clientSecret) return config.microsoft;
+  return undefined;
 }
