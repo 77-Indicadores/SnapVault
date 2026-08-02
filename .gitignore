@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+build/
+.turbo/
+.vite/
+*.tsbuildinfo
+
+coverage/
+*.log
+
+data/
+staging/
+tmp/

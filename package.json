@@ -1,0 +1,20 @@
+{
+  "name": "snapvault",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm:dev -w apps/api\" \"npm:dev -w apps/web\"",
+    "build": "npm run build -w apps/api && npm run build -w apps/web",
+    "test": "npm run test -w apps/api",
+    "start:api": "npm run start -w apps/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0",
+    "playwright": "^1.62.1",
+    "typescript": "^5.5.4"
+  }
+}

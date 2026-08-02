@@ -1,0 +1,61 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file:
+      - .env
+    environment:
+      PORT: 4000
+      HOST: 0.0.0.0
+      SNAPVAULT_DATABASE_PATH: /data/snapvault.json
+      SNAPVAULT_STAGING_DIR: /staging
+      SNAPVAULT_WEB_ORIGIN: http://localhost:8080
+      SNAPVAULT_SECRET_KEY: ${SNAPVAULT_SECRET_KEY:-local-dev-secret}
+    volumes:
+      - snapvault-data:/data
+      - snapvault-staging:/staging
+      - ./tmp/rclone:/config/rclone
+    ports:
+      - "4000:4000"
+    depends_on:
+      - postgres
+      - minio
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+volumes:
+  snapvault-data:
+  snapvault-staging:
+  pg-data:
+  minio-data:
