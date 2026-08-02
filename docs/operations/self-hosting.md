@@ -50,6 +50,8 @@ MVP precisa dos binarios:
 
 As imagens Docker oficiais do SnapVault devem incluir esses binarios ou validar claramente sua ausencia.
 
+Para PostgreSQL, o `pg_dump` da imagem precisa ser da mesma versao major ou mais novo que o servidor protegido. A imagem Docker do MVP instala `postgresql-client-16`, compatível com servidores PostgreSQL 16 usados no compose local.
+
 ## Microsoft SharePoint / OneDrive
 
 O admin pode configurar uma ou mais integracoes Microsoft na interface. Cada integracao possui `Tenant ID`, `Client ID` e `Client Secret` proprios. Depois disso, a tela `Storage` escolhe qual integracao usar e lista:
