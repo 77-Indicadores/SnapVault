@@ -66,6 +66,7 @@ function App() {
   const [setup, setSetup] = useState<boolean | null>(null);
   const [user, setUser] = useState<any>(null);
   const [data, setData] = useState<AppData>(emptyData);
+  const [timezone, setTimezone] = useState("America/Sao_Paulo");
   const [view, setView] = useState<View>("overview");
   const [wizardOpen, setWizardOpen] = useState(false);
   const [sourceOpen, setSourceOpen] = useState(false);
@@ -99,7 +100,10 @@ function App() {
         try {
           const me = await api("/auth/me");
           setUser(me.user);
-          await refresh();
+          const [, settings] = await Promise.all([refresh(), api("/settings")]);
+          const tz = settings.timezone ?? "America/Sao_Paulo";
+          setTimezone(tz);
+          setSystemTimezone(tz);
         } catch {
           setUser(null);
         }
@@ -185,13 +189,13 @@ function App() {
   if (!user) return <AuthMode mode="login" error={error} setError={setError} onDone={(logged) => { setUser(logged); refresh(); }} />;
 
   return (
-    <AppShell user={user} view={view} setView={setView} onNewBackup={() => setWizardOpen(true)}>
+    <AppShell user={user} view={view} setView={setView} onNewBackup={() => setWizardOpen(true)} timezone={timezone}>
       {notice && <div className={`toast ${notice.tone}`} role="status" aria-live="polite">{notice.text}</div>}
       {view === "overview" && <OverviewPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onPolicyOpen={(id) => { setSelectedPolicyId(id); setView("backups"); }} busy={busy} />}
       {view === "backups" && (selectedPolicyId ? <BackupDetailPage data={data} policyId={selectedPolicyId} onBack={() => setSelectedPolicyId("")} onRun={runNow} onEdit={setEditingPolicy} onRestore={setRestoreRequest} onToggle={togglePolicy} refresh={refresh} showNotice={showNotice} busy={busy} /> : <BackupsPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onPolicyOpen={setSelectedPolicyId} onEdit={setEditingPolicy} onToggle={togglePolicy} onDelete={deletePolicy} busy={busy} />)}
       {view === "sources" && <SourcesPage data={data} refresh={refresh} openCreate={() => setSourceOpen(true)} openEdit={setEditingSource} showNotice={showNotice} />}
       {view === "storage" && <StoragePage data={data} refresh={refresh} openCreate={() => setStorageOpen(true)} openEdit={setEditingStorage} showNotice={showNotice} />}
-      {view === "settings" && <SettingsPage user={user} onLogout={logout} showNotice={showNotice} />}
+      {view === "settings" && <SettingsPage user={user} onLogout={logout} showNotice={showNotice} timezone={timezone} onTimezoneChange={(tz) => { setTimezone(tz); setSystemTimezone(tz); }} />}
       {wizardOpen && <NewBackupWizard data={data} onCreateSource={() => setSourceOpen(true)} onCreateStorage={() => setStorageOpen(true)} onClose={() => setWizardOpen(false)} onDone={async () => { setWizardOpen(false); await refresh(); setView("overview"); showNotice({ tone: "success", text: "Rotina criada e primeira execucao iniciada." }); }} />}
       {sourceOpen && <SourceWizard onClose={() => setSourceOpen(false)} onDone={async () => { setSourceOpen(false); await refresh(); showNotice({ tone: "success", text: "Origem conectada e testada." }); }} />}
       {editingSource && <SourceWizard source={editingSource} onClose={() => setEditingSource(null)} onDone={async () => { setEditingSource(null); await refresh(); showNotice({ tone: "success", text: "Origem atualizada." }); }} />}
@@ -203,7 +207,18 @@ function App() {
   );
 }
 
-function AppShell({ children, user, view, setView, onNewBackup }: { children: React.ReactNode; user?: any; view?: View; setView?: (view: View) => void; onNewBackup?: () => void }) {
+function SystemClock({ timezone }: { timezone: string }) {
+  const [time, setTime] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const formatted = new Intl.DateTimeFormat("pt-BR", { timeZone: timezone, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(time);
+  const abbr = new Intl.DateTimeFormat("pt-BR", { timeZone: timezone, timeZoneName: "short" }).formatToParts(time).find((p) => p.type === "timeZoneName")?.value ?? "";
+  return <span className="systemClock" title={timezone}>{formatted} <span className="clockTz">{abbr}</span></span>;
+}
+
+function AppShell({ children, user, view, setView, onNewBackup, timezone }: { children: React.ReactNode; user?: any; view?: View; setView?: (view: View) => void; onNewBackup?: () => void; timezone?: string }) {
   const nav: Array<[View, string]> = [["overview", "Overview"], ["backups", "Backups"], ["sources", "Sources"], ["storage", "Storage"], ["settings", "Settings"]];
   return (
     <main className="shell">
@@ -218,6 +233,7 @@ function AppShell({ children, user, view, setView, onNewBackup }: { children: Re
               {nav.map(([key, label]) => <button key={key} className={view === key ? "active" : ""} onClick={() => setView?.(key)}>{label}</button>)}
             </nav>
             <div className="topActions">
+              {timezone && <SystemClock timezone={timezone} />}
               <span className="account">{user.email}</span>
               <button className="primaryButton" onClick={onNewBackup}><Plus size={15} /> Novo backup</button>
             </div>
@@ -545,13 +561,58 @@ function RestorePage({ data, showNotice }: { data: AppData; showNotice: (notice:
   );
 }
 
-function SettingsPage({ user, onLogout, showNotice }: { user: any; onLogout: () => void; showNotice: (notice: Notice) => void }) {
+const TIMEZONE_OPTIONS = [
+  { value: "America/Sao_Paulo", label: "Brasília (BRT / BRST) — padrão" },
+  { value: "America/Manaus", label: "Manaus (AMT)" },
+  { value: "America/Belem", label: "Belém (BRT)" },
+  { value: "America/Fortaleza", label: "Fortaleza (BRT)" },
+  { value: "America/Recife", label: "Recife (BRT)" },
+  { value: "America/Porto_Velho", label: "Porto Velho (AMT)" },
+  { value: "America/Boa_Vista", label: "Boa Vista (AMT)" },
+  { value: "America/Cuiaba", label: "Cuiabá (AMT / AMST)" },
+  { value: "America/Noronha", label: "Fernando de Noronha (FNT)" },
+  { value: "America/Rio_Branco", label: "Rio Branco (ACT)" },
+  { value: "UTC", label: "UTC" },
+  { value: "America/New_York", label: "New York (ET)" },
+  { value: "Europe/Lisbon", label: "Lisboa (WET / WEST)" },
+  { value: "Europe/London", label: "Londres (GMT / BST)" },
+];
+
+function SettingsPage({ user, onLogout, showNotice, timezone, onTimezoneChange }: { user: any; onLogout: () => void; showNotice: (notice: Notice) => void; timezone: string; onTimezoneChange: (tz: string) => void }) {
+  const [tzBusy, setTzBusy] = useState(false);
+
+  const saveTimezone = async (tz: string) => {
+    setTzBusy(true);
+    try {
+      await api("/settings", { method: "PATCH", body: JSON.stringify({ timezone: tz }) });
+      onTimezoneChange(tz);
+      showNotice({ tone: "success", text: "Timezone atualizado." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setTzBusy(false);
+    }
+  };
+
   return (
     <>
       <PageTitle eyebrow="Settings" title="Configuracoes" text="Estado da instalacao self-hosted, sessao e integracoes operacionais." action={<button className="secondaryButton" onClick={onLogout}><LogOut size={15} /> Sair</button>} />
       <section className="settingsGrid">
         <InfoCard title="Conta" rows={[["Usuario", user.email], ["Perfil", user.role]]} />
         <InfoCard title="Operacao" rows={[["Ambiente", "self-hosted"], ["Segredos", "criptografados localmente"], ["Interface", "sem expor secret salvo"]]} />
+      </section>
+      <section className="card">
+        <SectionHeader title="Timezone do sistema" />
+        <div className="sideCopy">
+          <strong>Fuso horario de referencia</strong>
+          <span>Define como agendamentos sao interpretados e como horarios sao exibidos no sistema. O relogio na barra superior reflete este timezone.</span>
+        </div>
+        <div className="tzSelector">
+          <select value={timezone} onChange={(e) => saveTimezone(e.target.value)} disabled={tzBusy}>
+            {TIMEZONE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+          </select>
+          {tzBusy && <Loader2 className="spin" size={15} />}
+        </div>
       </section>
       <MicrosoftIntegrationsPanel showNotice={showNotice} />
     </>
@@ -663,7 +724,7 @@ function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDon
       let destinationId = selectedDestinationId;
       if (!destinationId) throw new Error("Conecte e teste um armazenamento antes de criar a rotina.");
       const sourceScope = buildSourceScope(sourceType, scopeMode, selectedResource, prefix);
-      const schedule = frequency === "manual" ? { type: "manual", timezone: "America/Sao_Paulo" } : { type: frequency, time: "02:00", timezone: "America/Sao_Paulo" };
+      const schedule = frequency === "manual" ? { type: "manual", timezone: _systemTimezone } : { type: frequency, time: "02:00", timezone: _systemTimezone };
       const policy = await api("/policies", { method: "POST", body: JSON.stringify({ name: routineName, sourceId, destinationId, sourceScope, schedule, retention: { keepLast, keepDays }, options: { compression: "gzip", encryption: false, verifyAfterUpload: true }, enabled: true }) });
       const run = await api(`/policies/${policy.policy.id}/run`, { method: "POST", body: "{}" });
       onDone(run.runId);
@@ -976,7 +1037,7 @@ function PolicyWizard({ data, policy, onClose, onDone }: { data: AppData; policy
     setBusy(true);
     setError("");
     try {
-      const schedule = frequency === "manual" ? { type: "manual", timezone: "America/Sao_Paulo" } : { type: frequency, time, weekday, timezone: "America/Sao_Paulo" };
+      const schedule = frequency === "manual" ? { type: "manual", timezone: _systemTimezone } : { type: frequency, time, weekday, timezone: _systemTimezone };
       const sourceScope = buildSourceScope(selectedSource?.type === "minio" ? "minio" : "postgres", scopeMode, selectedResource, prefix);
       await api(`/policies/${policy.id}`, { method: "PATCH", body: JSON.stringify({ name, sourceId, destinationId, sourceScope, schedule, retention: { keepLast, keepDays }, enabled }) });
       onDone();
@@ -1342,11 +1403,18 @@ function verificationLabel(run: Run) {
   return "nao verificado";
 }
 
+function tzAbbr(timezone: string) {
+  return new Intl.DateTimeFormat("pt-BR", { timeZone: timezone, timeZoneName: "short" })
+    .formatToParts(new Date()).find((p) => p.type === "timeZoneName")?.value ?? timezone;
+}
+
 function scheduleLabel(policy: BackupRoutine) {
   const type = policy.schedule?.type;
   const time = policy.schedule?.time ?? "02:00";
-  if (type === "weekly") return `semanal, ${time}`;
-  if (type === "daily") return `diario, ${time}`;
+  const tz = policy.schedule?.timezone ?? _systemTimezone;
+  const abbr = tzAbbr(tz);
+  if (type === "weekly") return `semanal, ${time} ${abbr}`;
+  if (type === "daily") return `diario, ${time} ${abbr}`;
   return "manual";
 }
 
@@ -1390,8 +1458,11 @@ function formatBytes(value: number | null) {
   return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-function formatDate(value: string) {
-  return new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "short" }).format(new Date(value));
+let _systemTimezone = "America/Sao_Paulo";
+export function setSystemTimezone(tz: string) { _systemTimezone = tz; }
+
+function formatDate(value: string, timezone?: string) {
+  return new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "short", timeZone: timezone ?? _systemTimezone }).format(new Date(value));
 }
 
 function readableGraphError(message: string) {

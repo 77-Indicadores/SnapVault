@@ -4,7 +4,7 @@ import type { Database } from "./types.js";
 import { id, now } from "./ids.js";
 
 const emptyDb = (): Database => ({
-  settings: { microsoft: null },
+  settings: { microsoft: null, timezone: "America/Sao_Paulo" },
   microsoftIntegrations: [],
   users: [],
   sessions: [],
@@ -76,7 +76,8 @@ export const publicMicrosoftIntegration = (microsoft: any) => {
 export const publicMicrosoftConfig = (settings: Database["settings"]) => publicMicrosoftIntegration(settings?.microsoft);
 
 function migrateDatabase(db: Database): Database {
-  db.settings = db.settings ?? { microsoft: null };
+  db.settings = db.settings ?? { microsoft: null, timezone: "America/Sao_Paulo" };
+  db.settings.timezone = db.settings.timezone ?? "America/Sao_Paulo";
   db.microsoftIntegrations = db.microsoftIntegrations ?? [];
   if (db.settings.microsoft && !db.microsoftIntegrations.some((item) => item.id === db.settings!.microsoft!.id)) {
     const stamp = now();
