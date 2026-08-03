@@ -162,6 +162,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .pageTitle span {
@@ -218,16 +220,32 @@ p {
 .secondaryButton.small, .primaryButton.small { min-height: 34px; font-size: 13px; padding: 0 10px; }
 .primaryButton.full, .secondaryButton.full { width: 100%; }
 
+.heroCards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
 .heroCard {
-  min-height: 132px;
+  min-height: 80px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 24px;
+  padding: 20px 24px;
   display: flex;
   align-items: flex-start;
   gap: 16px;
-  margin-bottom: 24px;
   background: var(--surface);
+}
+
+.heroCard--warn {
+  border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
+  background: color-mix(in srgb, var(--warning) 6%, var(--surface));
+}
+
+.heroCard--info {
+  border-color: color-mix(in srgb, var(--info) 40%, var(--border));
+  background: color-mix(in srgb, var(--info) 6%, var(--surface));
 }
 
 .statusDot {
@@ -249,6 +267,10 @@ p {
   grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
   gap: 24px;
   margin-bottom: 24px;
+}
+
+.overviewGrid--full {
+  grid-template-columns: 1fr;
 }
 
 .trustGrid {
@@ -485,6 +507,7 @@ p {
   justify-content: flex-end;
   gap: 8px;
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 .runList {
@@ -501,6 +524,21 @@ p {
   gap: 12px;
   text-align: left;
   border-radius: 6px;
+}
+
+.runItemMeta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.runItemPolicy {
+  font-size: 12px;
+  color: var(--secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .runItem:hover { background: var(--subtle); }
@@ -828,7 +866,8 @@ input::placeholder { color: #999; }
 }
 
 .reviewRow:last-child { border-bottom: 0; }
-.reviewRow span { color: var(--secondary); }
+.reviewRow span { color: var(--secondary); flex-shrink: 0; }
+.reviewRow strong { text-align: right; word-break: break-word; }
 
 .wizardFooter {
   border-top: 1px solid var(--border);
