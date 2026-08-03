@@ -370,25 +370,7 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onEdit, onRestore, on
         <TrustCard title="Tamanho" value={formatBytes(latest?.bytesWritten ?? null)} />
       </section>
 
-      <div className="detailMeta">
-        <InfoCard title="Configuracao" rows={[["Origem", source?.name ?? "nao encontrada"], ["Escopo", source ? sourceScopeLabel(source.type as SourceType, policySourceScope(policy, source)) : "-"], ["Destino", destination?.name ?? "nao encontrado"], ["Pasta", destination?.basePath ?? "-"], ["Frequencia", scheduleLabel(policy)], ["Retencao", retentionLabel(policy)]]} />
-        <section className="card">
-          <SectionHeader title="Recuperacao" />
-          <div className="sideCopy">
-            {isPg && isAllScope ? (
-              <>
-                <strong>Restore manual necessario</strong>
-                <span>Esta rotina usa <code>pg_dumpall</code> (todas as databases). O restore automatico nao e suportado para este escopo — use o arquivo gerado com <code>psql</code> manualmente.</span>
-              </>
-            ) : (
-              <>
-                <strong>{recoverable ? "Restore validado" : restoreFailed ? "Restore falhou" : "Restore ainda nao validado"}</strong>
-                <span>{recoverable ? "Esta rotina possui evidencia de recuperacao." : restoreFailed ? "O arquivo existe, mas o restore automatico falhou. Abra a execucao para ver os logs." : "O restore automatico roda apos cada backup verificado. Voce tambem pode testar manualmente pelo historico."}</span>
-              </>
-            )}
-          </div>
-        </section>
-      </div>
+      <InfoCard title="Configuracao" rows={[["Origem", source?.name ?? "nao encontrada"], ["Escopo", source ? sourceScopeLabel(source.type as SourceType, policySourceScope(policy, source)) : "-"], ["Destino", destination?.name ?? "nao encontrado"], ["Pasta", destination?.basePath ?? "-"], ["Frequencia", scheduleLabel(policy)], ["Retencao", retentionLabel(policy)]]} />
 
       <section className="sectionBlock">
         <SectionHeader title="Historico desta rotina" />
