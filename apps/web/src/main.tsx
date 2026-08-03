@@ -52,7 +52,7 @@ type Destination = { id: string; name: string; type: DestinationType | string; s
 type BackupRoutine = { id: string; name: string; sourceId: string; destinationId: string; sourceScope?: SourceScope; enabled: boolean; schedule?: { type: string; time?: string; weekday?: number; timezone?: string }; retention?: { keepLast: number; keepDays: number } };
 type Run = { id: string; policyId: string; sourceId?: string; destinationId?: string; trigger?: "manual" | "scheduled" | "retry"; status: string; verificationStatus?: string; verifiedAt?: string | null; createdAt: string; finishedAt?: string | null; bytesWritten: number | null; errorMessage: string | null };
 type Artifact = { id: string; kind: string; path: string; sizeBytes: number | null; checksumSha256: string | null };
-type RunDetailData = { run: Run; logs: Array<{ message: string; level: string; createdAt: string; data?: any }>; artifacts: Artifact[] };
+type RunDetailData = { run: Run; logs: Array<{ message: string; level: string; createdAt: string; data?: any }>; artifacts: Artifact[]; logsTruncated?: number };
 type AppData = { sources: Source[]; destinations: Destination[]; policies: BackupRoutine[]; runs: Run[] };
 type Notice = { tone: "success" | "error"; text: string } | null;
 type RestoreRequest = { runId: string; artifact: Artifact; sourceType: string };
@@ -370,39 +370,37 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onEdit, onRestore, on
         <TrustCard title="Tamanho" value={formatBytes(latest?.bytesWritten ?? null)} />
       </section>
 
-      <section className="detailGrid">
+      <section className="detailCols">
+        <div className="detailColMain">
         <section className="sectionBlock">
           <SectionHeader title="Historico desta rotina" />
           {!runs.length ? <EmptyState compact title="Sem execucoes" text="Execute agora para gerar o primeiro backup." /> : (
             <div className="itemList">
               {runs.map((run) => (
-                <article className="listItem" key={run.id}>
+                <article className="listItem listItemAccordion" key={run.id}>
                   <button className={`itemMain itemButton${panelRunId === run.id ? " active" : ""}`} onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}>
                     <strong>{formatDate(run.createdAt)}</strong>
                     <span>{run.trigger === "scheduled" ? "agendado" : run.trigger === "retry" ? "retry" : "manual"} · {verificationLabel(run)} · {formatBytes(run.bytesWritten)}</span>
                   </button>
                   <StatusBadge status={run.status} />
                   <div className="rowActions">
-                    <button className="secondaryButton small" onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}><FileArchive size={14} /> Detalhes</button>
+                    <button className={`secondaryButton small${panelRunId === run.id ? " active" : ""}`} onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}><FileArchive size={14} /> Detalhes</button>
                     {!(isPg && isAllScope) && !["queued","running"].includes(run.status) && <button className="secondaryButton small" disabled={testBusy === run.id} onClick={() => testRestore(run.id)}>{testBusy === run.id ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />} Testar restore</button>}
                     {!["queued","running"].includes(run.status) && <button className="primaryButton small" disabled={restoreBusy === run.id} onClick={() => prepareRestore(run.id)}>{restoreBusy === run.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />} Recuperar</button>}
                   </div>
+                  {panelRunId === run.id && (
+                    <div className="accordionDetail">
+                      <RunDetail runId={run.id} />
+                    </div>
+                  )}
                 </article>
               ))}
             </div>
           )}
         </section>
+        </div>
         <aside className="detailSide">
-          {panelRunId ? (
-            <section className="card runPanel">
-              <header className="runPanelHeader">
-                <span>Execucao</span>
-                <button className="iconOnly" onClick={() => setPanelRunId("")} aria-label="Fechar painel"><X size={16} /></button>
-              </header>
-              <RunDetail runId={panelRunId} />
-            </section>
-          ) : (
-            <>
+          <>
               <InfoCard title="Configuracao" rows={[["Origem", source?.name ?? "nao encontrada"], ["Escopo", source ? sourceScopeLabel(source.type as SourceType, policySourceScope(policy, source)) : "-"], ["Destino", destination?.name ?? "nao encontrado"], ["Pasta", destination?.basePath ?? "-"], ["Frequencia", scheduleLabel(policy)], ["Retencao", retentionLabel(policy)]]} />
               <section className="card">
                 <SectionHeader title="Recuperacao" />
@@ -421,7 +419,6 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onEdit, onRestore, on
                 </div>
               </section>
             </>
-          )}
         </aside>
       </section>
     </>
@@ -1155,7 +1152,13 @@ function RunDetail({ runId }: { runId: string }) {
   const load = (setNull: boolean) => {
     let active = true;
     if (setNull) { setDetail(null); setError(""); }
-    api(`/runs/${runId}`).then((d) => { if (active) setDetail(d); }).catch((err) => { if (active) setError(err.message); });
+    fetch(`/api/v1/runs/${runId}`, { credentials: "include" })
+      .then(async (res) => {
+        const truncated = res.headers.get("X-Log-Truncated");
+        const d = await res.json();
+        if (active) setDetail({ ...d, logsTruncated: truncated ? Number(truncated) : undefined });
+      })
+      .catch((err) => { if (active) setError(err.message); });
     return () => { active = false; };
   };
 
@@ -1205,6 +1208,7 @@ function RunDetail({ runId }: { runId: string }) {
           )}
         </div>
       } />
+      {detail.logsTruncated && <p className="logTruncatedNote">Mostrando ultimas 500 de {detail.logsTruncated} linhas.</p>}
       <div className="logBox" ref={logBoxRef}>
         {detail.run.errorMessage && <code className="log-error">{formatDate(detail.run.finishedAt ?? detail.run.createdAt)} error: {detail.run.errorMessage}</code>}
         {detail.logs.length

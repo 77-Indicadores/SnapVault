@@ -558,12 +558,16 @@ app.get("/api/v1/runs", { preHandler: requireAuth }, async () => {
   return { runs: [...db.runs].sort((a, b) => b.createdAt.localeCompare(a.createdAt)) };
 });
 
-app.get("/api/v1/runs/:id", { preHandler: requireAuth }, async (request) => {
+app.get("/api/v1/runs/:id", { preHandler: requireAuth }, async (request, reply) => {
   const params = z.object({ id: z.string() }).parse(request.params);
   const db = await store.read();
+  const LOG_LIMIT = 500;
+  const allLogs = db.logs.filter((item) => item.runId === params.id);
+  const truncated = allLogs.length > LOG_LIMIT;
+  if (truncated) reply.header("X-Log-Truncated", String(allLogs.length));
   return {
     run: db.runs.find((item) => item.id === params.id),
-    logs: db.logs.filter((item) => item.runId === params.id),
+    logs: truncated ? allLogs.slice(-LOG_LIMIT) : allLogs,
     artifacts: db.artifacts.filter((item) => item.runId === params.id)
   };
 });

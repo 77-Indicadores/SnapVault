@@ -321,9 +321,37 @@ p {
   align-items: start;
 }
 
+.detailCols {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, .8fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.detailColMain {
+  min-width: 0;
+}
+
 .detailSide {
   display: grid;
   gap: 16px;
+}
+
+.listItemAccordion {
+  grid-template-rows: auto;
+}
+
+.accordionDetail {
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--border);
+  padding: 16px 0 8px;
+}
+
+.logTruncatedNote {
+  font-size: 12px;
+  color: var(--secondary);
+  margin: 0 0 6px;
+  padding: 0 2px;
 }
 
 .runPanel {
