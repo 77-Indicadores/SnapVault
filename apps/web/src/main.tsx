@@ -370,56 +370,51 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onEdit, onRestore, on
         <TrustCard title="Tamanho" value={formatBytes(latest?.bytesWritten ?? null)} />
       </section>
 
-      <section className="detailCols">
-        <div className="detailColMain">
-        <section className="sectionBlock">
-          <SectionHeader title="Historico desta rotina" />
-          {!runs.length ? <EmptyState compact title="Sem execucoes" text="Execute agora para gerar o primeiro backup." /> : (
-            <div className="itemList">
-              {runs.map((run) => (
-                <article className="listItem listItemAccordion" key={run.id}>
-                  <button className={`itemMain itemButton${panelRunId === run.id ? " active" : ""}`} onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}>
-                    <strong>{formatDate(run.createdAt)}</strong>
-                    <span>{run.trigger === "scheduled" ? "agendado" : run.trigger === "retry" ? "retry" : "manual"} · {verificationLabel(run)} · {formatBytes(run.bytesWritten)}</span>
-                  </button>
-                  <StatusBadge status={run.status} />
-                  <div className="rowActions">
-                    <button className={`secondaryButton small${panelRunId === run.id ? " active" : ""}`} onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}><FileArchive size={14} /> Detalhes</button>
-                    {!(isPg && isAllScope) && !["queued","running"].includes(run.status) && <button className="secondaryButton small" disabled={testBusy === run.id} onClick={() => testRestore(run.id)}>{testBusy === run.id ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />} Testar restore</button>}
-                    {!["queued","running"].includes(run.status) && <button className="primaryButton small" disabled={restoreBusy === run.id} onClick={() => prepareRestore(run.id)}>{restoreBusy === run.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />} Recuperar</button>}
-                  </div>
-                  {panelRunId === run.id && (
-                    <div className="accordionDetail">
-                      <RunDetail runId={run.id} />
-                    </div>
-                  )}
-                </article>
-              ))}
-            </div>
-          )}
+      <div className="detailMeta">
+        <InfoCard title="Configuracao" rows={[["Origem", source?.name ?? "nao encontrada"], ["Escopo", source ? sourceScopeLabel(source.type as SourceType, policySourceScope(policy, source)) : "-"], ["Destino", destination?.name ?? "nao encontrado"], ["Pasta", destination?.basePath ?? "-"], ["Frequencia", scheduleLabel(policy)], ["Retencao", retentionLabel(policy)]]} />
+        <section className="card">
+          <SectionHeader title="Recuperacao" />
+          <div className="sideCopy">
+            {isPg && isAllScope ? (
+              <>
+                <strong>Restore manual necessario</strong>
+                <span>Esta rotina usa <code>pg_dumpall</code> (todas as databases). O restore automatico nao e suportado para este escopo — use o arquivo gerado com <code>psql</code> manualmente.</span>
+              </>
+            ) : (
+              <>
+                <strong>{recoverable ? "Restore validado" : restoreFailed ? "Restore falhou" : "Restore ainda nao validado"}</strong>
+                <span>{recoverable ? "Esta rotina possui evidencia de recuperacao." : restoreFailed ? "O arquivo existe, mas o restore automatico falhou. Abra a execucao para ver os logs." : "O restore automatico roda apos cada backup verificado. Voce tambem pode testar manualmente pelo historico."}</span>
+              </>
+            )}
+          </div>
         </section>
-        </div>
-        <aside className="detailSide">
-          <>
-              <InfoCard title="Configuracao" rows={[["Origem", source?.name ?? "nao encontrada"], ["Escopo", source ? sourceScopeLabel(source.type as SourceType, policySourceScope(policy, source)) : "-"], ["Destino", destination?.name ?? "nao encontrado"], ["Pasta", destination?.basePath ?? "-"], ["Frequencia", scheduleLabel(policy)], ["Retencao", retentionLabel(policy)]]} />
-              <section className="card">
-                <SectionHeader title="Recuperacao" />
-                <div className="sideCopy">
-                  {isPg && isAllScope ? (
-                    <>
-                      <strong>Restore manual necessario</strong>
-                      <span>Esta rotina usa <code>pg_dumpall</code> (todas as databases). O restore automatico nao e suportado para este escopo — use o arquivo gerado com <code>psql</code> manualmente.</span>
-                    </>
-                  ) : (
-                    <>
-                      <strong>{recoverable ? "Restore validado" : restoreFailed ? "Restore falhou" : "Restore ainda nao validado"}</strong>
-                      <span>{recoverable ? "Esta rotina possui evidencia de recuperacao." : restoreFailed ? "O arquivo existe, mas o restore automatico falhou. Abra a execucao para ver os logs." : "O restore automatico roda apos cada backup verificado. Voce tambem pode testar manualmente pelo historico."}</span>
-                    </>
-                  )}
+      </div>
+
+      <section className="sectionBlock">
+        <SectionHeader title="Historico desta rotina" />
+        {!runs.length ? <EmptyState compact title="Sem execucoes" text="Execute agora para gerar o primeiro backup." /> : (
+          <div className="itemList">
+            {runs.map((run) => (
+              <article className="listItem listItemAccordion" key={run.id}>
+                <button className={`itemMain itemButton${panelRunId === run.id ? " active" : ""}`} onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}>
+                  <strong>{formatDate(run.createdAt)}</strong>
+                  <span>{run.trigger === "scheduled" ? "agendado" : run.trigger === "retry" ? "retry" : "manual"} · {verificationLabel(run)} · {formatBytes(run.bytesWritten)}</span>
+                </button>
+                <StatusBadge status={run.status} />
+                <div className="rowActions">
+                  <button className={`secondaryButton small${panelRunId === run.id ? " active" : ""}`} onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}><FileArchive size={14} /> Detalhes</button>
+                  {!(isPg && isAllScope) && !["queued","running"].includes(run.status) && <button className="secondaryButton small" disabled={testBusy === run.id} onClick={() => testRestore(run.id)}>{testBusy === run.id ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />} Testar restore</button>}
+                  {!["queued","running"].includes(run.status) && <button className="primaryButton small" disabled={restoreBusy === run.id} onClick={() => prepareRestore(run.id)}>{restoreBusy === run.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />} Recuperar</button>}
                 </div>
-              </section>
-            </>
-        </aside>
+                {panelRunId === run.id && (
+                  <div className="accordionDetail">
+                    <RunDetail runId={run.id} />
+                  </div>
+                )}
+              </article>
+            ))}
+          </div>
+        )}
       </section>
     </>
   );
