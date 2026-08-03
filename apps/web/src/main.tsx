@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  AlertTriangle,
   Archive,
   Check,
   ChevronLeft,
@@ -48,7 +49,7 @@ type Frequency = "manual" | "daily" | "weekly";
 type Source = { id: string; name: string; type: SourceType | string; status: string; config?: any; metadata?: any; lastTestedAt?: string | null };
 type Destination = { id: string; name: string; type: DestinationType | string; status: string; basePath: string; config?: any; metadata?: any; lastTestedAt?: string | null };
 type BackupRoutine = { id: string; name: string; sourceId: string; destinationId: string; sourceScope?: SourceScope; enabled: boolean; schedule?: { type: string; time?: string; weekday?: number; timezone?: string }; retention?: { keepLast: number; keepDays: number } };
-type Run = { id: string; policyId: string; sourceId?: string; destinationId?: string; status: string; verificationStatus?: string; verifiedAt?: string | null; createdAt: string; finishedAt?: string | null; bytesWritten: number | null; errorMessage: string | null };
+type Run = { id: string; policyId: string; sourceId?: string; destinationId?: string; trigger?: "manual" | "scheduled" | "retry"; status: string; verificationStatus?: string; verifiedAt?: string | null; createdAt: string; finishedAt?: string | null; bytesWritten: number | null; errorMessage: string | null };
 type Artifact = { id: string; kind: string; path: string; sizeBytes: number | null; checksumSha256: string | null };
 type RunDetailData = { run: Run; logs: Array<{ message: string; level: string; createdAt: string; data?: any }>; artifacts: Artifact[] };
 type AppData = { sources: Source[]; destinations: Destination[]; policies: BackupRoutine[]; runs: Run[] };
@@ -250,19 +251,37 @@ function OverviewPage({ data, onNewBackup, onRun, onPolicyOpen, busy }: { data: 
   const verified = latest?.status === "verified" || latest?.status === "recoverable" || latest?.verificationStatus === "integrity_verified";
   const recoverable = latest?.status === "recoverable" || latest?.verificationStatus === "restore_verified";
   const ready = data.sources.length > 0 && data.destinations.length > 0 && data.policies.length > 0 && verified;
+  const hasFailure = data.runs.slice(0, 10).some((r) => r.status === "failed" || r.status === "restore_failed");
+  const hasActive = data.runs.some((r) => r.status === "queued" || r.status === "running");
+  const checklistDone = data.sources.length > 0 && data.destinations.length > 0 && data.policies.length > 0 &&
+    data.runs.some((r) => r.status === "recoverable" || r.verificationStatus === "restore_verified");
   return (
     <>
       <PageTitle eyebrow="Overview" title="Backups sem barulho." text="Configure uma vez, rode automaticamente e veja rapidamente se seus dados estao protegidos." />
-      <section className="heroCard">
-        <div className={`statusDot ${ready ? "ok" : "warn"}`}><ShieldCheck size={18} /></div>
-        <div>
-          <h2>{recoverable ? "Restore testado recentemente" : ready ? "Ultimo backup verificado" : "Finalize a primeira protecao"}</h2>
-          <p>{recoverable ? "Existe um backup recente que passou por verificacao de restore." : ready ? "O arquivo foi gerado, checado por integridade e enviado ao destino. Restore automatico ainda fica separado." : "Siga os passos abaixo para criar o primeiro backup automatico."}</p>
-        </div>
-      </section>
-      <section className="overviewGrid">
+      <div className="heroCards">
+        <section className="heroCard">
+          <div className={`statusDot ${ready ? "ok" : "warn"}`}><ShieldCheck size={18} /></div>
+          <div>
+            <h2>{recoverable ? "Restore testado recentemente" : ready ? "Ultimo backup verificado" : "Finalize a primeira protecao"}</h2>
+            <p>{recoverable ? "Existe um backup recente que passou por verificacao de restore." : ready ? "O arquivo foi gerado, checado por integridade e enviado ao destino." : "Siga os passos abaixo para criar o primeiro backup automatico."}</p>
+          </div>
+        </section>
+        {hasActive && (
+          <section className="heroCard heroCard--info">
+            <div className="statusDot"><Loader2 className="spin" size={18} /></div>
+            <div><h2>Backup em andamento</h2><p>Ha uma execucao ativa no momento.</p></div>
+          </section>
+        )}
+        {hasFailure && (
+          <section className="heroCard heroCard--warn">
+            <div className="statusDot warn"><AlertTriangle size={18} /></div>
+            <div><h2>Falha recente detectada</h2><p>Uma ou mais execucoes recentes falharam. Verifique o historico.</p></div>
+          </section>
+        )}
+      </div>
+      <section className={`overviewGrid${checklistDone ? " overviewGrid--full" : ""}`}>
         <SetupChecklist data={data} onNewBackup={onNewBackup} />
-        <RecentRuns runs={data.runs} />
+        <RecentRuns runs={data.runs} policies={data.policies} />
       </section>
       <section className="sectionBlock">
         <SectionHeader title="Backups configurados" action={<button className="secondaryButton" onClick={onNewBackup}><Plus size={15} /> Adicionar</button>} />
@@ -359,13 +378,13 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onEdit, onRestore, on
                 <article className="listItem" key={run.id}>
                   <button className={`itemMain itemButton${panelRunId === run.id ? " active" : ""}`} onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}>
                     <strong>{formatDate(run.createdAt)}</strong>
-                    <span>{run.id} · {verificationLabel(run)} · {formatBytes(run.bytesWritten)}</span>
+                    <span>{run.trigger === "scheduled" ? "agendado" : run.trigger === "retry" ? "retry" : "manual"} · {verificationLabel(run)} · {formatBytes(run.bytesWritten)}</span>
                   </button>
                   <StatusBadge status={run.status} />
                   <div className="rowActions">
                     <button className="secondaryButton small" onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}><FileArchive size={14} /> Detalhes</button>
-                    {!(isPg && isAllScope) && <button className="secondaryButton small" disabled={testBusy === run.id} onClick={() => testRestore(run.id)}>{testBusy === run.id ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />} Testar restore</button>}
-                    <button className="primaryButton small" disabled={restoreBusy === run.id} onClick={() => prepareRestore(run.id)}>{restoreBusy === run.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />} Recuperar</button>
+                    {!(isPg && isAllScope) && !["queued","running"].includes(run.status) && <button className="secondaryButton small" disabled={testBusy === run.id} onClick={() => testRestore(run.id)}>{testBusy === run.id ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />} Testar restore</button>}
+                    {!["queued","running"].includes(run.status) && <button className="primaryButton small" disabled={restoreBusy === run.id} onClick={() => prepareRestore(run.id)}>{restoreBusy === run.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />} Recuperar</button>}
                   </div>
                 </article>
               ))}
@@ -539,7 +558,7 @@ function RestorePage({ data, showNotice }: { data: AppData; showNotice: (notice:
                 <div className="itemMain">
                   <button className={`itemButton${openRunId === run.id ? " active" : ""}`} onClick={() => setOpenRunId(openRunId === run.id ? "" : run.id)}>
                     <strong>{formatDate(run.createdAt)}</strong>
-                    <span>{run.id} · {formatBytes(run.bytesWritten)}</span>
+                    <span>{run.trigger === "scheduled" ? "agendado" : run.trigger === "retry" ? "retry" : "manual"} · {formatBytes(run.bytesWritten)}</span>
                   </button>
                 </div>
                 <StatusBadge status={run.status} />
@@ -1327,7 +1346,7 @@ function StorageList({ destinations, dependencyCount, onTest, onEdit, onArchive,
   })}</div>;
 }
 
-function RecentRuns({ runs }: { runs: Run[] }) {
+function RecentRuns({ runs, policies }: { runs: Run[]; policies: BackupRoutine[] }) {
   const [openRunId, setOpenRunId] = useState("");
   return (
     <section className="card">
@@ -1335,11 +1354,13 @@ function RecentRuns({ runs }: { runs: Run[] }) {
       {!runs.length
         ? <EmptyState title="Sem historico" text="As execucoes aparecem aqui depois do primeiro backup." compact />
         : <div className="runList">
-            {runs.slice(0, 4).map((run) => (
+            {runs.slice(0, 6).map((run) => {
+              const policyName = policies.find((p) => p.id === run.policyId)?.name;
+              return (
               <div key={run.id}>
                 <button className={`runItem${openRunId === run.id ? " active" : ""}`} onClick={() => setOpenRunId(openRunId === run.id ? "" : run.id)}>
                   <StatusBadge status={run.status} />
-                  <code>{formatDate(run.createdAt)}</code>
+                  <span className="runItemMeta"><code>{formatDate(run.createdAt)}</code>{policyName && <span className="runItemPolicy">{policyName}</span>}</span>
                   <span>{formatBytes(run.bytesWritten)}</span>
                 </button>
                 {openRunId === run.id && (
@@ -1348,7 +1369,8 @@ function RecentRuns({ runs }: { runs: Run[] }) {
                   </div>
                 )}
               </div>
-            ))}
+            );
+            })}
           </div>
       }
     </section>

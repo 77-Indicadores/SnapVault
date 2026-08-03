@@ -826,4 +826,16 @@ function startScheduler() {
 }
 
 await app.listen({ host: config.host, port: config.port });
+
+await store.update((db) => {
+  for (const run of db.runs) {
+    if (run.status === "running" || run.status === "queued") {
+      run.status = "failed";
+      run.errorCode = "server_restart";
+      run.errorMessage = "Execucao interrompida por reinicializacao do servidor.";
+      run.finishedAt = run.finishedAt ?? now();
+    }
+  }
+});
+
 startScheduler();
