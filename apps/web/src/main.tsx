@@ -1,10 +1,11 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Archive,
   Check,
   ChevronLeft,
   Cloud,
+  Copy,
   Database,
   FileArchive,
   FolderClock,
@@ -32,6 +33,9 @@ const api = async (path: string, options: RequestInit = {}) => {
     headers,
     credentials: "include"
   });
+  if (res.status === 401) {
+    window.dispatchEvent(new CustomEvent("sv:session-expired"));
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error?.message ?? "Request failed");
   return data;
@@ -46,7 +50,7 @@ type Destination = { id: string; name: string; type: DestinationType | string; s
 type BackupRoutine = { id: string; name: string; sourceId: string; destinationId: string; sourceScope?: SourceScope; enabled: boolean; schedule?: { type: string; time?: string; weekday?: number; timezone?: string }; retention?: { keepLast: number; keepDays: number } };
 type Run = { id: string; policyId: string; sourceId?: string; destinationId?: string; status: string; verificationStatus?: string; verifiedAt?: string | null; createdAt: string; finishedAt?: string | null; bytesWritten: number | null; errorMessage: string | null };
 type Artifact = { id: string; kind: string; path: string; sizeBytes: number | null; checksumSha256: string | null };
-type RunDetail = { run: Run; logs: Array<{ message: string; level: string; createdAt: string; data?: any }>; artifacts: Artifact[] };
+type RunDetailData = { run: Run; logs: Array<{ message: string; level: string; createdAt: string; data?: any }>; artifacts: Artifact[] };
 type AppData = { sources: Source[]; destinations: Destination[]; policies: BackupRoutine[]; runs: Run[] };
 type Notice = { tone: "success" | "error"; text: string } | null;
 type RestoreRequest = { runId: string; artifact: Artifact; sourceType: string };
@@ -62,13 +66,13 @@ function App() {
   const [setup, setSetup] = useState<boolean | null>(null);
   const [user, setUser] = useState<any>(null);
   const [data, setData] = useState<AppData>(emptyData);
+  const [timezone, setTimezone] = useState("America/Sao_Paulo");
   const [view, setView] = useState<View>("overview");
   const [wizardOpen, setWizardOpen] = useState(false);
   const [sourceOpen, setSourceOpen] = useState(false);
   const [editingSource, setEditingSource] = useState<Source | null>(null);
   const [storageOpen, setStorageOpen] = useState(false);
   const [editingStorage, setEditingStorage] = useState<Destination | null>(null);
-  const [selectedRunId, setSelectedRunId] = useState("");
   const [selectedPolicyId, setSelectedPolicyId] = useState("");
   const [editingPolicy, setEditingPolicy] = useState<BackupRoutine | null>(null);
   const [restoreRequest, setRestoreRequest] = useState<RestoreRequest | null>(null);
@@ -87,6 +91,8 @@ function App() {
     window.setTimeout(() => setNotice(null), 3500);
   };
 
+  const hasActiveJobs = data.runs.some((r) => r.status === "queued" || r.status === "running");
+
   useEffect(() => {
     fetch("/api/v1/setup/status").then((r) => r.json()).then(async (status) => {
       setSetup(status.requiresSetup);
@@ -94,7 +100,10 @@ function App() {
         try {
           const me = await api("/auth/me");
           setUser(me.user);
-          await refresh();
+          const [, settings] = await Promise.all([refresh(), api("/settings")]);
+          const tz = settings.timezone ?? "America/Sao_Paulo";
+          setTimezone(tz);
+          setSystemTimezone(tz);
         } catch {
           setUser(null);
         }
@@ -103,12 +112,38 @@ function App() {
     });
   }, []);
 
+  useEffect(() => {
+    if (!user || !hasActiveJobs) return;
+    const timer = setInterval(refresh, 3000);
+    return () => clearInterval(timer);
+  }, [user, hasActiveJobs]);
+
+  useEffect(() => {
+    const onExpired = () => setUser(null);
+    window.addEventListener("sv:session-expired", onExpired);
+    return () => window.removeEventListener("sv:session-expired", onExpired);
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (wizardOpen) { setWizardOpen(false); return; }
+      if (sourceOpen) { setSourceOpen(false); return; }
+      if (editingSource) { setEditingSource(null); return; }
+      if (storageOpen) { setStorageOpen(false); return; }
+      if (editingStorage) { setEditingStorage(null); return; }
+      if (editingPolicy) { setEditingPolicy(null); return; }
+      if (restoreRequest) { setRestoreRequest(null); return; }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [wizardOpen, sourceOpen, editingSource, storageOpen, editingStorage, editingPolicy, restoreRequest]);
+
   const runNow = async (policyId: string) => {
     setBusy(policyId);
     try {
-      const result = await api(`/policies/${policyId}/run`, { method: "POST", body: "{}" });
+      await api(`/policies/${policyId}/run`, { method: "POST", body: "{}" });
       showNotice({ tone: "success", text: "Backup iniciado." });
-      setSelectedRunId(result.runId);
       setTimeout(refresh, 900);
     } catch (err: any) {
       showNotice({ tone: "error", text: err.message });
@@ -131,6 +166,7 @@ function App() {
   };
 
   const deletePolicy = async (id: string) => {
+    if (!window.confirm("Remover esta rotina de backup? Esta ação não pode ser desfeita.")) return;
     setBusy(id);
     try {
       await api(`/policies/${id}`, { method: "DELETE" });
@@ -153,26 +189,36 @@ function App() {
   if (!user) return <AuthMode mode="login" error={error} setError={setError} onDone={(logged) => { setUser(logged); refresh(); }} />;
 
   return (
-    <AppShell user={user} view={view} setView={setView} onNewBackup={() => setWizardOpen(true)}>
-      {notice && <div className={`toast ${notice.tone}`}>{notice.text}</div>}
-      {view === "overview" && <OverviewPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onRunOpen={setSelectedRunId} onPolicyOpen={(id) => { setSelectedPolicyId(id); setView("backups"); }} busy={busy} />}
-      {view === "backups" && (selectedPolicyId ? <BackupDetailPage data={data} policyId={selectedPolicyId} onBack={() => setSelectedPolicyId("")} onRun={runNow} onRunOpen={setSelectedRunId} onEdit={setEditingPolicy} onRestore={setRestoreRequest} onToggle={togglePolicy} refresh={refresh} showNotice={showNotice} busy={busy} /> : <BackupsPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onRunOpen={setSelectedRunId} onPolicyOpen={setSelectedPolicyId} onEdit={setEditingPolicy} onToggle={togglePolicy} onDelete={deletePolicy} busy={busy} />)}
+    <AppShell user={user} view={view} setView={setView} onNewBackup={() => setWizardOpen(true)} timezone={timezone}>
+      {notice && <div className={`toast ${notice.tone}`} role="status" aria-live="polite">{notice.text}</div>}
+      {view === "overview" && <OverviewPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onPolicyOpen={(id) => { setSelectedPolicyId(id); setView("backups"); }} busy={busy} />}
+      {view === "backups" && (selectedPolicyId ? <BackupDetailPage data={data} policyId={selectedPolicyId} onBack={() => setSelectedPolicyId("")} onRun={runNow} onEdit={setEditingPolicy} onRestore={setRestoreRequest} onToggle={togglePolicy} refresh={refresh} showNotice={showNotice} busy={busy} /> : <BackupsPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onPolicyOpen={setSelectedPolicyId} onEdit={setEditingPolicy} onToggle={togglePolicy} onDelete={deletePolicy} busy={busy} />)}
       {view === "sources" && <SourcesPage data={data} refresh={refresh} openCreate={() => setSourceOpen(true)} openEdit={setEditingSource} showNotice={showNotice} />}
       {view === "storage" && <StoragePage data={data} refresh={refresh} openCreate={() => setStorageOpen(true)} openEdit={setEditingStorage} showNotice={showNotice} />}
-      {view === "settings" && <SettingsPage user={user} onLogout={logout} showNotice={showNotice} />}
-      {wizardOpen && <NewBackupWizard data={data} onCreateSource={() => setSourceOpen(true)} onCreateStorage={() => setStorageOpen(true)} onClose={() => setWizardOpen(false)} onDone={async (runId) => { setWizardOpen(false); await refresh(); if (runId) setSelectedRunId(runId); setView("overview"); showNotice({ tone: "success", text: "Rotina criada e primeira execucao iniciada." }); }} />}
+      {view === "settings" && <SettingsPage user={user} onLogout={logout} showNotice={showNotice} timezone={timezone} onTimezoneChange={(tz) => { setTimezone(tz); setSystemTimezone(tz); }} />}
+      {wizardOpen && <NewBackupWizard data={data} onCreateSource={() => setSourceOpen(true)} onCreateStorage={() => setStorageOpen(true)} onClose={() => setWizardOpen(false)} onDone={async () => { setWizardOpen(false); await refresh(); setView("overview"); showNotice({ tone: "success", text: "Rotina criada e primeira execucao iniciada." }); }} />}
       {sourceOpen && <SourceWizard onClose={() => setSourceOpen(false)} onDone={async () => { setSourceOpen(false); await refresh(); showNotice({ tone: "success", text: "Origem conectada e testada." }); }} />}
       {editingSource && <SourceWizard source={editingSource} onClose={() => setEditingSource(null)} onDone={async () => { setEditingSource(null); await refresh(); showNotice({ tone: "success", text: "Origem atualizada." }); }} />}
       {storageOpen && <StorageWizard onClose={() => setStorageOpen(false)} onDone={async () => { setStorageOpen(false); await refresh(); showNotice({ tone: "success", text: "Armazenamento conectado e testado." }); }} />}
       {editingStorage && <StorageWizard destination={editingStorage} onClose={() => setEditingStorage(null)} onDone={async () => { setEditingStorage(null); await refresh(); showNotice({ tone: "success", text: "Armazenamento atualizado." }); }} />}
       {editingPolicy && <PolicyWizard data={data} policy={editingPolicy} onClose={() => setEditingPolicy(null)} onDone={async () => { setEditingPolicy(null); await refresh(); showNotice({ tone: "success", text: "Rotina atualizada." }); }} />}
       {restoreRequest && <RestoreExecuteModal data={data} request={restoreRequest} onClose={() => setRestoreRequest(null)} onDone={async () => { setRestoreRequest(null); await refresh(); showNotice({ tone: "success", text: "Restore executado com sucesso." }); }} />}
-      {selectedRunId && <RunDetailModal runId={selectedRunId} onClose={() => setSelectedRunId("")} />}
     </AppShell>
   );
 }
 
-function AppShell({ children, user, view, setView, onNewBackup }: { children: React.ReactNode; user?: any; view?: View; setView?: (view: View) => void; onNewBackup?: () => void }) {
+function SystemClock({ timezone }: { timezone: string }) {
+  const [time, setTime] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const formatted = new Intl.DateTimeFormat("pt-BR", { timeZone: timezone, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(time);
+  const abbr = new Intl.DateTimeFormat("pt-BR", { timeZone: timezone, timeZoneName: "short" }).formatToParts(time).find((p) => p.type === "timeZoneName")?.value ?? "";
+  return <span className="systemClock" title={timezone}>{formatted} <span className="clockTz">{abbr}</span></span>;
+}
+
+function AppShell({ children, user, view, setView, onNewBackup, timezone }: { children: React.ReactNode; user?: any; view?: View; setView?: (view: View) => void; onNewBackup?: () => void; timezone?: string }) {
   const nav: Array<[View, string]> = [["overview", "Overview"], ["backups", "Backups"], ["sources", "Sources"], ["storage", "Storage"], ["settings", "Settings"]];
   return (
     <main className="shell">
@@ -187,6 +233,7 @@ function AppShell({ children, user, view, setView, onNewBackup }: { children: Re
               {nav.map(([key, label]) => <button key={key} className={view === key ? "active" : ""} onClick={() => setView?.(key)}>{label}</button>)}
             </nav>
             <div className="topActions">
+              {timezone && <SystemClock timezone={timezone} />}
               <span className="account">{user.email}</span>
               <button className="primaryButton" onClick={onNewBackup}><Plus size={15} /> Novo backup</button>
             </div>
@@ -198,7 +245,7 @@ function AppShell({ children, user, view, setView, onNewBackup }: { children: Re
   );
 }
 
-function OverviewPage({ data, onNewBackup, onRun, onRunOpen, onPolicyOpen, busy }: { data: AppData; onNewBackup: () => void; onRun: (id: string) => void; onRunOpen: (id: string) => void; onPolicyOpen: (id: string) => void; busy: string }) {
+function OverviewPage({ data, onNewBackup, onRun, onPolicyOpen, busy }: { data: AppData; onNewBackup: () => void; onRun: (id: string) => void; onPolicyOpen: (id: string) => void; busy: string }) {
   const latest = data.runs[0];
   const verified = latest?.status === "verified" || latest?.status === "recoverable" || latest?.verificationStatus === "integrity_verified";
   const recoverable = latest?.status === "recoverable" || latest?.verificationStatus === "restore_verified";
@@ -215,17 +262,17 @@ function OverviewPage({ data, onNewBackup, onRun, onRunOpen, onPolicyOpen, busy 
       </section>
       <section className="overviewGrid">
         <SetupChecklist data={data} onNewBackup={onNewBackup} />
-        <RecentRuns runs={data.runs} onOpen={onRunOpen} />
+        <RecentRuns runs={data.runs} />
       </section>
       <section className="sectionBlock">
         <SectionHeader title="Backups configurados" action={<button className="secondaryButton" onClick={onNewBackup}><Plus size={15} /> Adicionar</button>} />
-        <BackupList data={data} onRun={onRun} onRunOpen={onRunOpen} onPolicyOpen={onPolicyOpen} busy={busy} limit={4} />
+        <BackupList data={data} onRun={onRun} onPolicyOpen={onPolicyOpen} busy={busy} limit={4} />
       </section>
     </>
   );
 }
 
-function BackupsPage(props: { data: AppData; onNewBackup: () => void; onRun: (id: string) => void; onRunOpen: (id: string) => void; onPolicyOpen: (id: string) => void; onEdit: (policy: BackupRoutine) => void; onToggle: (policy: BackupRoutine) => void; onDelete: (id: string) => void; busy: string }) {
+function BackupsPage(props: { data: AppData; onNewBackup: () => void; onRun: (id: string) => void; onPolicyOpen: (id: string) => void; onEdit: (policy: BackupRoutine) => void; onToggle: (policy: BackupRoutine) => void; onDelete: (id: string) => void; busy: string }) {
   return (
     <>
       <PageTitle eyebrow="Backups" title="Rotinas de backup" text="Cada rotina define o que proteger, onde salvar e quando executar." />
@@ -236,9 +283,10 @@ function BackupsPage(props: { data: AppData; onNewBackup: () => void; onRun: (id
   );
 }
 
-function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onEdit, onRestore, onToggle, refresh, showNotice, busy }: { data: AppData; policyId: string; onBack: () => void; onRun: (id: string) => void; onRunOpen: (id: string) => void; onEdit: (policy: BackupRoutine) => void; onRestore: (request: RestoreRequest) => void; onToggle: (policy: BackupRoutine) => void; refresh: () => Promise<void>; showNotice: (notice: Notice) => void; busy: string }) {
+function BackupDetailPage({ data, policyId, onBack, onRun, onEdit, onRestore, onToggle, refresh, showNotice, busy }: { data: AppData; policyId: string; onBack: () => void; onRun: (id: string) => void; onEdit: (policy: BackupRoutine) => void; onRestore: (request: RestoreRequest) => void; onToggle: (policy: BackupRoutine) => void; refresh: () => Promise<void>; showNotice: (notice: Notice) => void; busy: string }) {
   const [restoreBusy, setRestoreBusy] = useState("");
   const [testBusy, setTestBusy] = useState("");
+  const [panelRunId, setPanelRunId] = useState("");
   const policy = data.policies.find((item) => item.id === policyId);
   if (!policy) return <EmptyState title="Backup nao encontrado" text="A rotina pode ter sido removida." />;
   const source = data.sources.find((item) => item.id === policy.sourceId);
@@ -248,11 +296,13 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onEdit, on
   const verified = latest?.status === "verified" || latest?.status === "recoverable" || latest?.verificationStatus === "integrity_verified";
   const recoverable = latest?.status === "recoverable" || latest?.verificationStatus === "restore_verified";
   const restoreFailed = latest?.status === "restore_failed";
+  const isAllScope = (policy.sourceScope as any)?.mode === "all";
+  const isPg = source?.type === "postgres";
 
   const prepareRestore = async (runId: string) => {
     setRestoreBusy(runId);
     try {
-      const detail: RunDetail = await api(`/runs/${runId}`);
+      const detail: RunDetailData = await api(`/runs/${runId}`);
       if (!detail.artifacts.length) throw new Error("Esta execucao nao possui artefatos.");
       const artifact = detail.artifacts.find((item) => item.kind !== "manifest") ?? detail.artifacts[0];
       onRestore({ runId, artifact, sourceType: source?.type ?? String(detail.run.sourceId ?? "") });
@@ -269,7 +319,7 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onEdit, on
       const result = await api(`/runs/${runId}/test-restore`, { method: "POST", body: "{}" });
       await refresh();
       showNotice({ tone: result.status === "recoverable" ? "success" : "error", text: result.message });
-      onRunOpen(runId);
+      setPanelRunId(runId);
     } catch (err: any) {
       showNotice({ tone: "error", text: err.message });
     } finally {
@@ -288,7 +338,7 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onEdit, on
         </div>
         <div className="detailActions">
           <button className="secondaryButton" onClick={() => onEdit(policy)}><Pencil size={15} /> Editar</button>
-          <button className="secondaryButton" disabled={busy === policy.id} onClick={() => onToggle(policy)}><Pause size={15} /> {policy.enabled ? "Pausar" : "Ativar"}</button>
+          <button className="secondaryButton" disabled={busy === policy.id} onClick={() => onToggle(policy)}>{policy.enabled ? <Pause size={15} /> : <Play size={15} />} {policy.enabled ? "Pausar" : "Ativar"}</button>
           <button className="primaryButton" disabled={busy === policy.id} onClick={() => onRun(policy.id)}>{busy === policy.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />} Executar agora</button>
         </div>
       </header>
@@ -307,14 +357,14 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onEdit, on
             <div className="itemList">
               {runs.map((run) => (
                 <article className="listItem" key={run.id}>
-                  <button className="itemMain itemButton" onClick={() => onRunOpen(run.id)}>
+                  <button className={`itemMain itemButton${panelRunId === run.id ? " active" : ""}`} onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}>
                     <strong>{formatDate(run.createdAt)}</strong>
                     <span>{run.id} · {verificationLabel(run)} · {formatBytes(run.bytesWritten)}</span>
                   </button>
                   <StatusBadge status={run.status} />
                   <div className="rowActions">
-                    <button className="secondaryButton small" onClick={() => onRunOpen(run.id)}><FileArchive size={14} /> Artefatos</button>
-                    <button className="secondaryButton small" disabled={testBusy === run.id} onClick={() => testRestore(run.id)}>{testBusy === run.id ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />} Testar restore</button>
+                    <button className="secondaryButton small" onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}><FileArchive size={14} /> Detalhes</button>
+                    {!(isPg && isAllScope) && <button className="secondaryButton small" disabled={testBusy === run.id} onClick={() => testRestore(run.id)}>{testBusy === run.id ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />} Testar restore</button>}
                     <button className="primaryButton small" disabled={restoreBusy === run.id} onClick={() => prepareRestore(run.id)}>{restoreBusy === run.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />} Recuperar</button>
                   </div>
                 </article>
@@ -323,14 +373,35 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onRunOpen, onEdit, on
           )}
         </section>
         <aside className="detailSide">
-          <InfoCard title="Configuracao" rows={[["Origem", source?.name ?? "nao encontrada"], ["Escopo", source ? sourceScopeLabel(source.type as SourceType, policySourceScope(policy, source)) : "-"], ["Destino", destination?.name ?? "nao encontrado"], ["Pasta", destination?.basePath ?? "-"], ["Frequencia", scheduleLabel(policy)], ["Retencao", retentionLabel(policy)]]} />
-          <section className="card">
-            <SectionHeader title="Recuperacao" />
-            <div className="sideCopy">
-              <strong>{recoverable ? "Restore validado" : restoreFailed ? "Restore falhou" : "Restore ainda nao validado"}</strong>
-              <span>{recoverable ? "Esta rotina possui evidencia de recuperacao." : restoreFailed ? "O arquivo existe, mas o restore automatico falhou. Abra a execucao para ver os logs." : "O restore automatico roda apos cada backup verificado. Voce tambem pode testar manualmente pelo historico."}</span>
-            </div>
-          </section>
+          {panelRunId ? (
+            <section className="card runPanel">
+              <header className="runPanelHeader">
+                <span>Execucao</span>
+                <button className="iconOnly" onClick={() => setPanelRunId("")} aria-label="Fechar painel"><X size={16} /></button>
+              </header>
+              <RunDetail runId={panelRunId} />
+            </section>
+          ) : (
+            <>
+              <InfoCard title="Configuracao" rows={[["Origem", source?.name ?? "nao encontrada"], ["Escopo", source ? sourceScopeLabel(source.type as SourceType, policySourceScope(policy, source)) : "-"], ["Destino", destination?.name ?? "nao encontrado"], ["Pasta", destination?.basePath ?? "-"], ["Frequencia", scheduleLabel(policy)], ["Retencao", retentionLabel(policy)]]} />
+              <section className="card">
+                <SectionHeader title="Recuperacao" />
+                <div className="sideCopy">
+                  {isPg && isAllScope ? (
+                    <>
+                      <strong>Restore manual necessario</strong>
+                      <span>Esta rotina usa <code>pg_dumpall</code> (todas as databases). O restore automatico nao e suportado para este escopo — use o arquivo gerado com <code>psql</code> manualmente.</span>
+                    </>
+                  ) : (
+                    <>
+                      <strong>{recoverable ? "Restore validado" : restoreFailed ? "Restore falhou" : "Restore ainda nao validado"}</strong>
+                      <span>{recoverable ? "Esta rotina possui evidencia de recuperacao." : restoreFailed ? "O arquivo existe, mas o restore automatico falhou. Abra a execucao para ver os logs." : "O restore automatico roda apos cada backup verificado. Voce tambem pode testar manualmente pelo historico."}</span>
+                    </>
+                  )}
+                </div>
+              </section>
+            </>
+          )}
         </aside>
       </section>
     </>
@@ -439,17 +510,18 @@ function SourcesPage({ data, refresh, openCreate, openEdit, showNotice }: { data
   );
 }
 
-function RestorePage({ data, onRunOpen, showNotice }: { data: AppData; onRunOpen: (id: string) => void; showNotice: (notice: Notice) => void }) {
+function RestorePage({ data, showNotice }: { data: AppData; showNotice: (notice: Notice) => void }) {
   const [busy, setBusy] = useState("");
+  const [openRunId, setOpenRunId] = useState("");
   const successfulRuns = data.runs.filter((run) => run.status === "success" || run.status === "verified" || run.status === "recoverable");
   const prepare = async (runId: string) => {
     setBusy(runId);
     try {
-      const detail: RunDetail = await api(`/runs/${runId}`);
+      const detail: RunDetailData = await api(`/runs/${runId}`);
       if (!detail.artifacts.length) throw new Error("Esta execucao nao possui artefatos.");
       const result = await api("/restores/prepare", { method: "POST", body: JSON.stringify({ artifactId: detail.artifacts[0].id }) });
       showNotice({ tone: "success", text: `Restore pronto: ${result.restore.sourceType}.` });
-      onRunOpen(runId);
+      setOpenRunId(runId);
     } catch (err: any) {
       showNotice({ tone: "error", text: err.message });
     } finally {
@@ -465,14 +537,21 @@ function RestorePage({ data, onRunOpen, showNotice }: { data: AppData; onRunOpen
             {successfulRuns.map((run) => (
               <article className="listItem" key={run.id}>
                 <div className="itemMain">
-                  <strong>{formatDate(run.createdAt)}</strong>
-                  <span>{run.id} · {formatBytes(run.bytesWritten)}</span>
+                  <button className={`itemButton${openRunId === run.id ? " active" : ""}`} onClick={() => setOpenRunId(openRunId === run.id ? "" : run.id)}>
+                    <strong>{formatDate(run.createdAt)}</strong>
+                    <span>{run.id} · {formatBytes(run.bytesWritten)}</span>
+                  </button>
                 </div>
                 <StatusBadge status={run.status} />
                 <div className="rowActions">
-                  <button className="secondaryButton small" onClick={() => onRunOpen(run.id)}><FileArchive size={14} /> Arquivos</button>
+                  <button className="secondaryButton small" onClick={() => setOpenRunId(openRunId === run.id ? "" : run.id)}><FileArchive size={14} /> Detalhes</button>
                   <button className="primaryButton small" disabled={busy === run.id} onClick={() => prepare(run.id)}>{busy === run.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />} Preparar</button>
                 </div>
+                {openRunId === run.id && (
+                  <div className="runItemDetail">
+                    <RunDetail runId={run.id} />
+                  </div>
+                )}
               </article>
             ))}
           </div>
@@ -482,13 +561,58 @@ function RestorePage({ data, onRunOpen, showNotice }: { data: AppData; onRunOpen
   );
 }
 
-function SettingsPage({ user, onLogout, showNotice }: { user: any; onLogout: () => void; showNotice: (notice: Notice) => void }) {
+const TIMEZONE_OPTIONS = [
+  { value: "America/Sao_Paulo", label: "Brasília (BRT / BRST) — padrão" },
+  { value: "America/Manaus", label: "Manaus (AMT)" },
+  { value: "America/Belem", label: "Belém (BRT)" },
+  { value: "America/Fortaleza", label: "Fortaleza (BRT)" },
+  { value: "America/Recife", label: "Recife (BRT)" },
+  { value: "America/Porto_Velho", label: "Porto Velho (AMT)" },
+  { value: "America/Boa_Vista", label: "Boa Vista (AMT)" },
+  { value: "America/Cuiaba", label: "Cuiabá (AMT / AMST)" },
+  { value: "America/Noronha", label: "Fernando de Noronha (FNT)" },
+  { value: "America/Rio_Branco", label: "Rio Branco (ACT)" },
+  { value: "UTC", label: "UTC" },
+  { value: "America/New_York", label: "New York (ET)" },
+  { value: "Europe/Lisbon", label: "Lisboa (WET / WEST)" },
+  { value: "Europe/London", label: "Londres (GMT / BST)" },
+];
+
+function SettingsPage({ user, onLogout, showNotice, timezone, onTimezoneChange }: { user: any; onLogout: () => void; showNotice: (notice: Notice) => void; timezone: string; onTimezoneChange: (tz: string) => void }) {
+  const [tzBusy, setTzBusy] = useState(false);
+
+  const saveTimezone = async (tz: string) => {
+    setTzBusy(true);
+    try {
+      await api("/settings", { method: "PATCH", body: JSON.stringify({ timezone: tz }) });
+      onTimezoneChange(tz);
+      showNotice({ tone: "success", text: "Timezone atualizado." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setTzBusy(false);
+    }
+  };
+
   return (
     <>
       <PageTitle eyebrow="Settings" title="Configuracoes" text="Estado da instalacao self-hosted, sessao e integracoes operacionais." action={<button className="secondaryButton" onClick={onLogout}><LogOut size={15} /> Sair</button>} />
       <section className="settingsGrid">
         <InfoCard title="Conta" rows={[["Usuario", user.email], ["Perfil", user.role]]} />
         <InfoCard title="Operacao" rows={[["Ambiente", "self-hosted"], ["Segredos", "criptografados localmente"], ["Interface", "sem expor secret salvo"]]} />
+      </section>
+      <section className="card">
+        <SectionHeader title="Timezone do sistema" />
+        <div className="sideCopy">
+          <strong>Fuso horario de referencia</strong>
+          <span>Define como agendamentos sao interpretados e como horarios sao exibidos no sistema. O relogio na barra superior reflete este timezone.</span>
+        </div>
+        <div className="tzSelector">
+          <select value={timezone} onChange={(e) => saveTimezone(e.target.value)} disabled={tzBusy}>
+            {TIMEZONE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+          </select>
+          {tzBusy && <Loader2 className="spin" size={15} />}
+        </div>
       </section>
       <MicrosoftIntegrationsPanel showNotice={showNotice} />
     </>
@@ -600,7 +724,7 @@ function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDon
       let destinationId = selectedDestinationId;
       if (!destinationId) throw new Error("Conecte e teste um armazenamento antes de criar a rotina.");
       const sourceScope = buildSourceScope(sourceType, scopeMode, selectedResource, prefix);
-      const schedule = frequency === "manual" ? { type: "manual", timezone: "America/Sao_Paulo" } : { type: frequency, time: "02:00", timezone: "America/Sao_Paulo" };
+      const schedule = frequency === "manual" ? { type: "manual", timezone: _systemTimezone } : { type: frequency, time: "02:00", timezone: _systemTimezone };
       const policy = await api("/policies", { method: "POST", body: JSON.stringify({ name: routineName, sourceId, destinationId, sourceScope, schedule, retention: { keepLast, keepDays }, options: { compression: "gzip", encryption: false, verifyAfterUpload: true }, enabled: true }) });
       const run = await api(`/policies/${policy.policy.id}/run`, { method: "POST", body: "{}" });
       onDone(run.runId);
@@ -626,8 +750,8 @@ function NewBackupWizard({ data, onCreateSource, onCreateStorage, onClose, onDon
     }).catch((err) => setError(err.message)).finally(() => setResourceBusy(false));
   }, [selectedSourceId, sourceType]);
   return (
-    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Novo backup">
-      <div className="wizard">
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Novo backup" onClick={onClose}>
+      <div className="wizard" onClick={(e) => e.stopPropagation()}>
         <header className="wizardHeader">
           <div><span>Novo backup</span><h2>{stepTitle(step)}</h2></div>
           <button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button>
@@ -748,8 +872,8 @@ function SourceWizard({ source, onClose, onDone }: { source?: Source; onClose: (
   };
 
   return (
-    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label={editing ? "Editar origem" : "Conectar origem"}>
-      <div className="wizard compactWizard">
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label={editing ? "Editar origem" : "Conectar origem"} onClick={onClose}>
+      <div className="wizard compactWizard" onClick={(e) => e.stopPropagation()}>
         <header className="wizardHeader"><div><span>Source</span><h2>{editing ? "Editar origem" : "Conectar origem"}</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
         <ChoiceGrid>
           <Choice active={type === "postgres"} icon={<Database size={18} />} title="PostgreSQL" text="Conexao reutilizavel; databases sao escolhidos na rotina." onClick={() => { setType("postgres"); setName("PostgreSQL"); }} />
@@ -855,8 +979,8 @@ function StorageWizard({ destination, onClose, onDone }: { destination?: Destina
   };
 
   return (
-    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label={editing ? "Editar armazenamento" : "Conectar armazenamento"}>
-      <div className="wizard compactWizard">
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label={editing ? "Editar armazenamento" : "Conectar armazenamento"} onClick={onClose}>
+      <div className="wizard compactWizard" onClick={(e) => e.stopPropagation()}>
         <header className="wizardHeader"><div><span>Storage</span><h2>{editing ? "Editar armazenamento" : "Conectar armazenamento"}</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
         <ChoiceGrid>
           <Choice active={type === "sharepoint"} icon={<Cloud size={18} />} title="SharePoint" text="Escolha site, biblioteca e pasta." onClick={() => { setType("sharepoint"); setName("SharePoint Backups"); }} />
@@ -913,7 +1037,7 @@ function PolicyWizard({ data, policy, onClose, onDone }: { data: AppData; policy
     setBusy(true);
     setError("");
     try {
-      const schedule = frequency === "manual" ? { type: "manual", timezone: "America/Sao_Paulo" } : { type: frequency, time, weekday, timezone: "America/Sao_Paulo" };
+      const schedule = frequency === "manual" ? { type: "manual", timezone: _systemTimezone } : { type: frequency, time, weekday, timezone: _systemTimezone };
       const sourceScope = buildSourceScope(selectedSource?.type === "minio" ? "minio" : "postgres", scopeMode, selectedResource, prefix);
       await api(`/policies/${policy.id}`, { method: "PATCH", body: JSON.stringify({ name, sourceId, destinationId, sourceScope, schedule, retention: { keepLast, keepDays }, enabled }) });
       onDone();
@@ -924,8 +1048,8 @@ function PolicyWizard({ data, policy, onClose, onDone }: { data: AppData; policy
     }
   };
   return (
-    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Editar rotina">
-      <div className="wizard compactWizard">
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Editar rotina" onClick={onClose}>
+      <div className="wizard compactWizard" onClick={(e) => e.stopPropagation()}>
         <header className="wizardHeader"><div><span>Backup</span><h2>Editar rotina</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
         <ChoiceGrid>
           <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} /></Field>
@@ -979,8 +1103,8 @@ function RestoreExecuteModal({ data, request, onClose, onDone }: { data: AppData
     }
   };
   return (
-    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Executar restore">
-      <div className="wizard compactWizard">
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Executar restore" onClick={onClose}>
+      <div className="wizard compactWizard" onClick={(e) => e.stopPropagation()}>
         <header className="wizardHeader"><div><span>Restore</span><h2>Recuperar backup</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
         <div className="reviewBox">
           <ReviewRow label="Execucao" value={request.runId} />
@@ -995,42 +1119,93 @@ function RestoreExecuteModal({ data, request, onClose, onDone }: { data: AppData
   );
 }
 
-function RunDetailModal({ runId, onClose }: { runId: string; onClose: () => void }) {
-  const [detail, setDetail] = useState<RunDetail | null>(null);
+function RunDetail({ runId }: { runId: string }) {
+  const [detail, setDetail] = useState<RunDetailData | null>(null);
   const [error, setError] = useState("");
+  const logBoxRef = useRef<HTMLDivElement>(null);
+  const isActive = detail?.run.status === "queued" || detail?.run.status === "running";
+
+  const load = (setNull: boolean) => {
+    let active = true;
+    if (setNull) { setDetail(null); setError(""); }
+    api(`/runs/${runId}`).then((d) => { if (active) setDetail(d); }).catch((err) => { if (active) setError(err.message); });
+    return () => { active = false; };
+  };
+
+  useEffect(() => load(true), [runId]);
+
   useEffect(() => {
-    api(`/runs/${runId}`).then(setDetail).catch((err) => setError(err.message));
-  }, [runId]);
+    if (!isActive) return;
+    const timer = setInterval(() => load(false), 2500);
+    return () => clearInterval(timer);
+  }, [runId, isActive]);
+
+  useEffect(() => {
+    if (logBoxRef.current) logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+  }, [detail?.logs.length]);
+  if (!detail && !error) return <div className="loading mini"><Loader2 className="spin" size={18} /> Carregando</div>;
+  if (error) return <p className="formError">{error}</p>;
+  if (!detail) return null;
   return (
-    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Detalhes da execucao">
-      <div className="wizard compactWizard">
-        <header className="wizardHeader"><div><span>Historico</span><h2>Execucao</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
-        {!detail && !error && <div className="loading mini"><Loader2 className="spin" size={18} /> Carregando</div>}
-        {error && <p className="formError">{error}</p>}
-        {detail && (
-          <div className="detailBody">
-            <ReviewRow label="Status" value={statusLabel(detail.run.status)} />
-            <ReviewRow label="Integridade" value={verificationLabel(detail.run)} />
-            <ReviewRow label="Criado em" value={formatDate(detail.run.createdAt)} />
-            <ReviewRow label="Tamanho" value={formatBytes(detail.run.bytesWritten)} />
-            <SectionHeader title="Arquivos" />
-            {!detail.artifacts.length ? <EmptyState compact title="Sem arquivos" text="A execucao ainda nao gerou artefatos." /> : detail.artifacts.map((artifact) => <div className="artifactRow" key={artifact.id}><FileArchive size={16} /><div><strong>{artifact.path.split(/[\\/]/).pop() ?? artifact.kind}</strong><span>{artifact.path} · {formatBytes(artifact.sizeBytes)}</span></div></div>)}
-            <SectionHeader title="Logs" />
-            <div className="logBox">
-              {detail.run.errorMessage && <code>{formatDate(detail.run.finishedAt ?? detail.run.createdAt)} error: {detail.run.errorMessage}</code>}
-              {detail.logs.length ? detail.logs.map((log, index) => <code key={index}>{formatDate(log.createdAt)} {log.level}: {log.message}{log.data?.error ? ` - ${log.data.error}` : ""}</code>) : <code>Sem logs registrados.</code>}
+    <div className="detailBody">
+      <ReviewRow label="Status" value={statusLabel(detail.run.status)} />
+      <ReviewRow label="Integridade" value={verificationLabel(detail.run)} />
+      <ReviewRow label="Criado em" value={formatDate(detail.run.createdAt)} />
+      <ReviewRow label="Tamanho" value={formatBytes(detail.run.bytesWritten)} />
+      <SectionHeader title="Arquivos" />
+      {!detail.artifacts.filter((a) => a.kind !== "manifest").length
+        ? <EmptyState compact title="Sem arquivos" text="A execucao ainda nao gerou artefatos." />
+        : detail.artifacts.filter((a) => a.kind !== "manifest").map((artifact) => (
+            <div className="artifactRow" key={artifact.id}>
+              <FileArchive size={16} />
+              <div>
+                <strong>{artifact.kind === "postgres_dump" ? "Dump PostgreSQL" : artifact.kind === "minio_snapshot" ? "Snapshot MinIO" : artifact.path.split(/[\\/]/).pop() ?? artifact.kind}</strong>
+                <span>{formatBytes(artifact.sizeBytes)}</span>
+                <span className="artifactPath">{artifact.path}</span>
+              </div>
             </div>
-          </div>
-        )}
+          ))
+      }
+      <SectionHeader title="Logs" action={
+        <div className="rowActions">
+          {isActive && <span className="liveBadge"><span className="liveDot" />ao vivo</span>}
+          {detail.logs.length > 0 && (
+            <button className="iconOnly" title="Copiar logs" onClick={() => {
+              const text = detail.logs.map((l) => `${formatDate(l.createdAt)} ${l.level}: ${l.message}${l.data?.error ? ` - ${l.data.error}` : ""}`).join("\n");
+              navigator.clipboard.writeText(text);
+            }}><Copy size={14} /></button>
+          )}
+        </div>
+      } />
+      <div className="logBox" ref={logBoxRef}>
+        {detail.run.errorMessage && <code className="log-error">{formatDate(detail.run.finishedAt ?? detail.run.createdAt)} error: {detail.run.errorMessage}</code>}
+        {detail.logs.length
+          ? detail.logs.map((log, index) => <code key={index} className={`log-${log.level}`}>{formatDate(log.createdAt)} {log.level}: {log.message}{log.data?.error ? ` - ${log.data.error}` : ""}</code>)
+          : <code>Sem logs registrados.</code>
+        }
+      </div>
+    </div>
+  );
+}
+
+function RunDetailModal({ runId, onClose }: { runId: string; onClose: () => void }) {
+  return (
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Detalhes da execucao" onClick={onClose}>
+      <div className="wizard compactWizard" onClick={(e) => e.stopPropagation()}>
+        <header className="wizardHeader">
+          <div><span>Historico</span><h2>Execucao</h2></div>
+          <button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button>
+        </header>
+        <RunDetail runId={runId} />
       </div>
     </div>
   );
 }
 
 function AuthMode({ mode, error, setError, onDone }: { mode: "setup" | "login"; error: string; setError: (value: string) => void; onDone: (user: any) => void }) {
-  const [name, setName] = useState("Admin");
-  const [email, setEmail] = useState("admin@example.com");
-  const [password, setPassword] = useState("password123");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -1052,7 +1227,7 @@ function AuthMode({ mode, error, setError, onDone }: { mode: "setup" | "login"; 
       <form className="authCard" onSubmit={submit}>
         <div className="authMark"><KeyRound size={19} /></div>
         <h1>{mode === "setup" ? "Criar administrador" : "Entrar no SnapVault"}</h1>
-        <p>Backups automaticos para PostgreSQL e MinIO, com restore e historico em um lugar simples.</p>
+        {mode === "setup" && <p>Configure o administrador inicial do SnapVault para comecar a proteger seus dados.</p>}
         {mode === "setup" && <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} /></Field>}
         <Field label="Email"><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
         <Field label="Senha"><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
@@ -1068,7 +1243,7 @@ function SetupChecklist({ data, onNewBackup }: { data: AppData; onNewBackup: () 
   return <section className="card"><SectionHeader title="Proximos passos" /><div className="checkList">{items.map(([label, done]) => <div className="checkItem" key={label}><span className={done ? "done" : ""}>{done ? <Check size={13} /> : null}</span>{label}</div>)}</div><button className="secondaryButton full" onClick={onNewBackup}>Configurar backup</button></section>;
 }
 
-function BackupList({ data, onRun, onPolicyOpen, onEdit, busy, limit, onToggle, onDelete }: { data: AppData; onRun: (id: string) => void; onRunOpen: (id: string) => void; onPolicyOpen: (id: string) => void; onEdit?: (policy: BackupRoutine) => void; busy: string; limit?: number; onToggle?: (policy: BackupRoutine) => void; onDelete?: (id: string) => void }) {
+function BackupList({ data, onRun, onPolicyOpen, onEdit, busy, limit, onToggle, onDelete }: { data: AppData; onRun: (id: string) => void; onPolicyOpen: (id: string) => void; onEdit?: (policy: BackupRoutine) => void; busy: string; limit?: number; onToggle?: (policy: BackupRoutine) => void; onDelete?: (id: string) => void }) {
   const items = limit ? data.policies.slice(0, limit) : data.policies;
   if (!items.length) return <EmptyState title="Nenhum backup automatico" text="Crie seu primeiro backup para proteger PostgreSQL ou MinIO." />;
   return (
@@ -1088,7 +1263,7 @@ function BackupList({ data, onRun, onPolicyOpen, onEdit, busy, limit, onToggle, 
             <div className="rowActions">
               <button className="secondaryButton small" disabled={busy === policy.id} onClick={() => onRun(policy.id)}>{busy === policy.id ? <Loader2 className="spin" size={14} /> : <Play size={14} />} Rodar</button>
               {onEdit && <button className="secondaryButton small" disabled={busy === policy.id} onClick={() => onEdit(policy)}><Pencil size={14} /> Editar</button>}
-              {onToggle && <button className="secondaryButton small" disabled={busy === policy.id} onClick={() => onToggle(policy)}><Pause size={14} /> {policy.enabled ? "Pausar" : "Ativar"}</button>}
+              {onToggle && <button className="secondaryButton small" disabled={busy === policy.id} onClick={() => onToggle(policy)}>{policy.enabled ? <Pause size={14} /> : <Play size={14} />} {policy.enabled ? "Pausar" : "Ativar"}</button>}
               {onDelete && <button className="iconOnly danger" disabled={busy === policy.id} onClick={() => onDelete(policy.id)} aria-label="Remover backup"><Trash2 size={15} /></button>}
             </div>
           </article>
@@ -1123,8 +1298,32 @@ function StorageList({ destinations, dependencyCount, onTest, onEdit, onArchive,
   })}</div>;
 }
 
-function RecentRuns({ runs, onOpen }: { runs: Run[]; onOpen: (id: string) => void }) {
-  return <section className="card"><SectionHeader title="Execucoes recentes" />{!runs.length ? <EmptyState title="Sem historico" text="As execucoes aparecem aqui depois do primeiro backup." compact /> : <div className="runList">{runs.slice(0, 4).map((run) => <button className="runItem" key={run.id} onClick={() => onOpen(run.id)}><StatusBadge status={run.status} /><code>{run.id}</code><span>{formatBytes(run.bytesWritten)}</span></button>)}</div>}</section>;
+function RecentRuns({ runs }: { runs: Run[] }) {
+  const [openRunId, setOpenRunId] = useState("");
+  return (
+    <section className="card">
+      <SectionHeader title="Execucoes recentes" />
+      {!runs.length
+        ? <EmptyState title="Sem historico" text="As execucoes aparecem aqui depois do primeiro backup." compact />
+        : <div className="runList">
+            {runs.slice(0, 4).map((run) => (
+              <div key={run.id}>
+                <button className={`runItem${openRunId === run.id ? " active" : ""}`} onClick={() => setOpenRunId(openRunId === run.id ? "" : run.id)}>
+                  <StatusBadge status={run.status} />
+                  <code>{formatDate(run.createdAt)}</code>
+                  <span>{formatBytes(run.bytesWritten)}</span>
+                </button>
+                {openRunId === run.id && (
+                  <div className="runItemDetail">
+                    <RunDetail runId={run.id} />
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+      }
+    </section>
+  );
 }
 
 function InfoCard({ title, rows }: { title: string; rows: Array<[string, string]> }) {
@@ -1181,7 +1380,21 @@ function stepTitle(step: number) {
 }
 
 function statusLabel(status: string) {
-  return status === "success" ? "enviado" : status === "verified" ? "verificado" : status === "recoverable" ? "restore testado" : status === "restore_failed" ? "restore falhou" : status === "failed" ? "falhou" : status === "healthy" ? "conectado" : status === "ready" ? "pronto" : status === "untested" ? "nao testado" : status === "paused" ? "pausado" : status === "archived" ? "arquivado" : status;
+  const labels: Record<string, string> = {
+    success: "enviado",
+    verified: "verificado",
+    recoverable: "restore testado",
+    restore_failed: "restore falhou",
+    failed: "falhou",
+    healthy: "conectado",
+    ready: "pronto",
+    untested: "nao testado",
+    paused: "pausado",
+    archived: "arquivado",
+    running: "em progresso",
+    queued: "na fila",
+  };
+  return labels[status] ?? status;
 }
 
 function verificationLabel(run: Run) {
@@ -1190,11 +1403,18 @@ function verificationLabel(run: Run) {
   return "nao verificado";
 }
 
+function tzAbbr(timezone: string) {
+  return new Intl.DateTimeFormat("pt-BR", { timeZone: timezone, timeZoneName: "short" })
+    .formatToParts(new Date()).find((p) => p.type === "timeZoneName")?.value ?? timezone;
+}
+
 function scheduleLabel(policy: BackupRoutine) {
   const type = policy.schedule?.type;
   const time = policy.schedule?.time ?? "02:00";
-  if (type === "weekly") return `semanal, ${time}`;
-  if (type === "daily") return `diario, ${time}`;
+  const tz = policy.schedule?.timezone ?? _systemTimezone;
+  const abbr = tzAbbr(tz);
+  if (type === "weekly") return `semanal, ${time} ${abbr}`;
+  if (type === "daily") return `diario, ${time} ${abbr}`;
   return "manual";
 }
 
@@ -1230,14 +1450,19 @@ function retentionLabel(policy: BackupRoutine) {
 }
 
 function formatBytes(value: number | null) {
-  if (!value) return "0 B";
+  if (value === null || value === undefined) return "—";
+  if (value === 0) return "0 B";
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
-  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-function formatDate(value: string) {
-  return new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "short" }).format(new Date(value));
+let _systemTimezone = "America/Sao_Paulo";
+export function setSystemTimezone(tz: string) { _systemTimezone = tz; }
+
+function formatDate(value: string, timezone?: string) {
+  return new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "short", timeZone: timezone ?? _systemTimezone }).format(new Date(value));
 }
 
 function readableGraphError(message: string) {

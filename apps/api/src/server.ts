@@ -146,6 +146,21 @@ app.post("/api/v1/auth/logout", async (request, reply) => {
 
 app.get("/api/v1/auth/me", { preHandler: requireAuth }, async (request) => ({ user: publicUser((request as any).user) }));
 
+app.get("/api/v1/settings", { preHandler: requireAuth }, async () => {
+  const db = await store.read();
+  return { timezone: db.settings?.timezone ?? "America/Sao_Paulo" };
+});
+
+app.patch("/api/v1/settings", { preHandler: requireAuth }, async (request) => {
+  const body = z.object({ timezone: z.string().min(1) }).parse(request.body);
+  const result = await store.update((db) => {
+    db.settings = db.settings ?? { microsoft: null, timezone: "America/Sao_Paulo" };
+    db.settings.timezone = body.timezone;
+    return { timezone: db.settings.timezone };
+  });
+  return result;
+});
+
 app.get("/api/v1/integrations/microsoft", { preHandler: requireAuth }, async () => {
   const db = await store.read();
   return { integrations: (db.microsoftIntegrations ?? []).map(publicMicrosoftIntegrationSafe) };
@@ -757,19 +772,34 @@ async function microsoftCredentials(integrationId?: string) {
   throw new Error("Microsoft credentials are not configured");
 }
 
+function timeInZone(date: Date, timezone: string): { hhmm: string; weekday: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    hour: "2-digit", minute: "2-digit", weekday: "short",
+    hour12: false
+  }).formatToParts(date);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  const hh = get("hour").padStart(2, "0");
+  const mm = get("minute").padStart(2, "0");
+  const weekdayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const weekday = weekdayNames.indexOf(get("weekday"));
+  return { hhmm: `${hh}:${mm}`, weekday };
+}
+
 function startScheduler() {
   setInterval(async () => {
     try {
       const db = await store.read();
+      const systemTimezone = db.settings?.timezone ?? "America/Sao_Paulo";
       const current = new Date();
-      const hhmm = current.toISOString().slice(11, 16);
-      const weekday = current.getUTCDay();
       for (const policy of db.policies) {
         if (!policy.enabled || policy.schedule.type === "manual" || policy.schedule.type === "cron") continue;
+        const tz = policy.schedule.timezone || systemTimezone;
+        const { hhmm, weekday } = timeInZone(current, tz);
         const wantedTime = policy.schedule.time ?? "02:00";
         if (wantedTime !== hhmm) continue;
         if (policy.schedule.type === "weekly" && Number(policy.schedule.weekday ?? 0) !== weekday) continue;
-        const key = `${policy.id}:${current.toISOString().slice(0, 16)}`;
+        const key = `${policy.id}:${hhmm}:${current.toISOString().slice(0, 10)}`;
         if (scheduledKeys.has(key)) continue;
         scheduledKeys.add(key);
         const source = db.sources.find((item) => item.id === policy.sourceId);

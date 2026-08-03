@@ -140,6 +140,7 @@ export type JobLogEntry = {
 export type Database = {
   settings?: {
     microsoft?: MicrosoftIntegration | null;
+    timezone?: string;
   };
   microsoftIntegrations?: MicrosoftIntegration[];
   users: User[];
