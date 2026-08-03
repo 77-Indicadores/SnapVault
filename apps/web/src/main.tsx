@@ -189,13 +189,13 @@ function App() {
   if (!user) return <AuthMode mode="login" error={error} setError={setError} onDone={(logged) => { setUser(logged); refresh(); }} />;
 
   return (
-    <AppShell user={user} view={view} setView={setView} onNewBackup={() => setWizardOpen(true)} timezone={timezone}>
+    <AppShell user={user} view={view} setView={setView} timezone={timezone} onLogout={logout}>
       {notice && <div className={`toast ${notice.tone}`} role="status" aria-live="polite">{notice.text}</div>}
       {view === "overview" && <OverviewPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onPolicyOpen={(id) => { setSelectedPolicyId(id); setView("backups"); }} busy={busy} />}
       {view === "backups" && (selectedPolicyId ? <BackupDetailPage data={data} policyId={selectedPolicyId} onBack={() => setSelectedPolicyId("")} onRun={runNow} onEdit={setEditingPolicy} onRestore={setRestoreRequest} onToggle={togglePolicy} refresh={refresh} showNotice={showNotice} busy={busy} /> : <BackupsPage data={data} onNewBackup={() => setWizardOpen(true)} onRun={runNow} onPolicyOpen={setSelectedPolicyId} onEdit={setEditingPolicy} onToggle={togglePolicy} onDelete={deletePolicy} busy={busy} />)}
       {view === "sources" && <SourcesPage data={data} refresh={refresh} openCreate={() => setSourceOpen(true)} openEdit={setEditingSource} showNotice={showNotice} />}
       {view === "storage" && <StoragePage data={data} refresh={refresh} openCreate={() => setStorageOpen(true)} openEdit={setEditingStorage} showNotice={showNotice} />}
-      {view === "settings" && <SettingsPage user={user} onLogout={logout} showNotice={showNotice} timezone={timezone} onTimezoneChange={(tz) => { setTimezone(tz); setSystemTimezone(tz); }} />}
+      {view === "settings" && <SettingsPage user={user} showNotice={showNotice} timezone={timezone} onTimezoneChange={(tz) => { setTimezone(tz); setSystemTimezone(tz); }} />}
       {wizardOpen && <NewBackupWizard data={data} onCreateSource={() => setSourceOpen(true)} onCreateStorage={() => setStorageOpen(true)} onClose={() => setWizardOpen(false)} onDone={async () => { setWizardOpen(false); await refresh(); setView("overview"); showNotice({ tone: "success", text: "Rotina criada e primeira execucao iniciada." }); }} />}
       {sourceOpen && <SourceWizard onClose={() => setSourceOpen(false)} onDone={async () => { setSourceOpen(false); await refresh(); showNotice({ tone: "success", text: "Origem conectada e testada." }); }} />}
       {editingSource && <SourceWizard source={editingSource} onClose={() => setEditingSource(null)} onDone={async () => { setEditingSource(null); await refresh(); showNotice({ tone: "success", text: "Origem atualizada." }); }} />}
@@ -218,7 +218,7 @@ function SystemClock({ timezone }: { timezone: string }) {
   return <span className="systemClock" title={timezone}>{formatted} <span className="clockTz">{abbr}</span></span>;
 }
 
-function AppShell({ children, user, view, setView, onNewBackup, timezone }: { children: React.ReactNode; user?: any; view?: View; setView?: (view: View) => void; onNewBackup?: () => void; timezone?: string }) {
+function AppShell({ children, user, view, setView, timezone, onLogout }: { children: React.ReactNode; user?: any; view?: View; setView?: (view: View) => void; timezone?: string; onLogout?: () => void }) {
   const nav: Array<[View, string]> = [["overview", "Overview"], ["backups", "Backups"], ["sources", "Sources"], ["storage", "Storage"], ["settings", "Settings"]];
   return (
     <main className="shell">
@@ -235,7 +235,7 @@ function AppShell({ children, user, view, setView, onNewBackup, timezone }: { ch
             <div className="topActions">
               {timezone && <SystemClock timezone={timezone} />}
               <span className="account">{user.email}</span>
-              <button className="primaryButton" onClick={onNewBackup}><Plus size={15} /> Novo backup</button>
+              {onLogout && <button className="iconOnly" onClick={onLogout} title="Sair" aria-label="Sair"><LogOut size={16} /></button>}
             </div>
           </>
         )}
@@ -578,7 +578,7 @@ const TIMEZONE_OPTIONS = [
   { value: "Europe/London", label: "Londres (GMT / BST)" },
 ];
 
-function SettingsPage({ user, onLogout, showNotice, timezone, onTimezoneChange }: { user: any; onLogout: () => void; showNotice: (notice: Notice) => void; timezone: string; onTimezoneChange: (tz: string) => void }) {
+function SettingsPage({ user, showNotice, timezone, onTimezoneChange }: { user: any; showNotice: (notice: Notice) => void; timezone: string; onTimezoneChange: (tz: string) => void }) {
   const [tzBusy, setTzBusy] = useState(false);
 
   const saveTimezone = async (tz: string) => {
@@ -596,25 +596,32 @@ function SettingsPage({ user, onLogout, showNotice, timezone, onTimezoneChange }
 
   return (
     <>
-      <PageTitle eyebrow="Settings" title="Configuracoes" text="Estado da instalacao self-hosted, sessao e integracoes operacionais." action={<button className="secondaryButton" onClick={onLogout}><LogOut size={15} /> Sair</button>} />
-      <section className="settingsGrid">
-        <InfoCard title="Conta" rows={[["Usuario", user.email], ["Perfil", user.role]]} />
-        <InfoCard title="Operacao" rows={[["Ambiente", "self-hosted"], ["Segredos", "criptografados localmente"], ["Interface", "sem expor secret salvo"]]} />
+      <PageTitle eyebrow="Settings" title="Configuracoes" text="Conta, sistema e integracoes." />
+      <section className="settingsStack">
+        <section className="card">
+          <SectionHeader title="Conta" />
+          <div className="reviewBox compactReview">
+            <ReviewRow label="Email" value={user.email} />
+            <ReviewRow label="Perfil" value={user.role} />
+          </div>
+        </section>
+        <section className="card">
+          <SectionHeader title="Sistema" />
+          <div className="settingsRow">
+            <div>
+              <strong>Timezone</strong>
+              <span>Referencia para agendamentos e exibicao de horarios. O relogio na barra reflete este fuso.</span>
+            </div>
+            <div className="tzSelector">
+              <select value={timezone} onChange={(e) => saveTimezone(e.target.value)} disabled={tzBusy}>
+                {TIMEZONE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+              </select>
+              {tzBusy && <Loader2 className="spin" size={15} />}
+            </div>
+          </div>
+        </section>
+        <MicrosoftIntegrationsPanel showNotice={showNotice} />
       </section>
-      <section className="card">
-        <SectionHeader title="Timezone do sistema" />
-        <div className="sideCopy">
-          <strong>Fuso horario de referencia</strong>
-          <span>Define como agendamentos sao interpretados e como horarios sao exibidos no sistema. O relogio na barra superior reflete este timezone.</span>
-        </div>
-        <div className="tzSelector">
-          <select value={timezone} onChange={(e) => saveTimezone(e.target.value)} disabled={tzBusy}>
-            {TIMEZONE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-          </select>
-          {tzBusy && <Loader2 className="spin" size={15} />}
-        </div>
-      </section>
-      <MicrosoftIntegrationsPanel showNotice={showNotice} />
     </>
   );
 }
@@ -1239,8 +1246,30 @@ function AuthMode({ mode, error, setError, onDone }: { mode: "setup" | "login"; 
 }
 
 function SetupChecklist({ data, onNewBackup }: { data: AppData; onNewBackup: () => void }) {
-  const items = [["Conectar origem", data.sources.length > 0], ["Conectar destino", data.destinations.length > 0], ["Criar backup automatico", data.policies.length > 0], ["Executar primeiro backup", data.runs.some((run) => run.status === "success" || run.status === "verified" || run.status === "recoverable")], ["Verificar integridade", data.runs.some((run) => run.status === "verified" || run.status === "recoverable" || run.verificationStatus === "integrity_verified")], ["Testar restore", data.runs.some((run) => run.status === "recoverable" || run.verificationStatus === "restore_verified")]] as const;
-  return <section className="card"><SectionHeader title="Proximos passos" /><div className="checkList">{items.map(([label, done]) => <div className="checkItem" key={label}><span className={done ? "done" : ""}>{done ? <Check size={13} /> : null}</span>{label}</div>)}</div><button className="secondaryButton full" onClick={onNewBackup}>Configurar backup</button></section>;
+  const items: Array<[string, boolean]> = [
+    ["Conectar origem", data.sources.length > 0],
+    ["Conectar destino", data.destinations.length > 0],
+    ["Criar backup automatico", data.policies.length > 0],
+    ["Executar primeiro backup", data.runs.some((r) => r.status === "success" || r.status === "verified" || r.status === "recoverable")],
+    ["Verificar integridade", data.runs.some((r) => r.status === "verified" || r.status === "recoverable" || r.verificationStatus === "integrity_verified")],
+    ["Testar restore", data.runs.some((r) => r.status === "recoverable" || r.verificationStatus === "restore_verified")],
+  ];
+  const allDone = items.every(([, done]) => done);
+  if (allDone) return null;
+  return (
+    <section className="card">
+      <SectionHeader title="Proximos passos" />
+      <div className="checkList">
+        {items.map(([label, done]) => (
+          <div className="checkItem" key={label}>
+            <span className={done ? "done" : ""}>{done ? <Check size={13} /> : null}</span>
+            {label}
+          </div>
+        ))}
+      </div>
+      <button className="secondaryButton full" onClick={onNewBackup}>Configurar backup</button>
+    </section>
+  );
 }
 
 function BackupList({ data, onRun, onPolicyOpen, onEdit, busy, limit, onToggle, onDelete }: { data: AppData; onRun: (id: string) => void; onPolicyOpen: (id: string) => void; onEdit?: (policy: BackupRoutine) => void; busy: string; limit?: number; onToggle?: (policy: BackupRoutine) => void; onDelete?: (id: string) => void }) {

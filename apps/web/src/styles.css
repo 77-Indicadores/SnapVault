@@ -113,12 +113,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   display: flex;
   align-items: center;
   gap: 10px;
-  padding-top: 16px;
 }
 
 .tzSelector select {
-  flex: 1;
-  max-width: 420px;
   padding: 8px 12px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
@@ -126,6 +123,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   color: var(--text);
   font-size: 14px;
   cursor: pointer;
+  min-width: 260px;
 }
 
 .page {
@@ -405,9 +403,10 @@ p {
   border-bottom: 1px solid var(--border);
   padding: 14px 20px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) minmax(max-content, auto) auto;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
 }
 
 .listItem:last-child { border-bottom: 0; }
@@ -556,6 +555,38 @@ code {
 
 .settingsPanel {
   margin-top: 20px;
+}
+
+.settingsStack {
+  display: grid;
+  gap: 16px;
+}
+
+.settingsRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding-top: 16px;
+  flex-wrap: wrap;
+}
+
+.settingsRow > div:first-child {
+  display: grid;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.settingsRow > div:first-child strong {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.settingsRow > div:first-child span {
+  font-size: 13px;
+  color: var(--secondary);
+  line-height: 1.5;
 }
 
 .formGrid {
