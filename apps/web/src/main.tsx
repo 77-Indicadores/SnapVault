@@ -359,13 +359,13 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onEdit, onRestore, on
                 <article className="listItem" key={run.id}>
                   <button className={`itemMain itemButton${panelRunId === run.id ? " active" : ""}`} onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}>
                     <strong>{formatDate(run.createdAt)}</strong>
-                    <span>{run.id} · {verificationLabel(run)} · {formatBytes(run.bytesWritten)}</span>
+                    <span>{run.trigger === "scheduled" ? "agendado" : run.trigger === "retry" ? "retry" : "manual"} · {verificationLabel(run)} · {formatBytes(run.bytesWritten)}</span>
                   </button>
                   <StatusBadge status={run.status} />
                   <div className="rowActions">
                     <button className="secondaryButton small" onClick={() => setPanelRunId(panelRunId === run.id ? "" : run.id)}><FileArchive size={14} /> Detalhes</button>
-                    {!(isPg && isAllScope) && <button className="secondaryButton small" disabled={testBusy === run.id} onClick={() => testRestore(run.id)}>{testBusy === run.id ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />} Testar restore</button>}
-                    <button className="primaryButton small" disabled={restoreBusy === run.id} onClick={() => prepareRestore(run.id)}>{restoreBusy === run.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />} Recuperar</button>
+                    {!(isPg && isAllScope) && !["queued","running"].includes(run.status) && <button className="secondaryButton small" disabled={testBusy === run.id} onClick={() => testRestore(run.id)}>{testBusy === run.id ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />} Testar restore</button>}
+                    {!["queued","running"].includes(run.status) && <button className="primaryButton small" disabled={restoreBusy === run.id} onClick={() => prepareRestore(run.id)}>{restoreBusy === run.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />} Recuperar</button>}
                   </div>
                 </article>
               ))}
@@ -539,7 +539,7 @@ function RestorePage({ data, showNotice }: { data: AppData; showNotice: (notice:
                 <div className="itemMain">
                   <button className={`itemButton${openRunId === run.id ? " active" : ""}`} onClick={() => setOpenRunId(openRunId === run.id ? "" : run.id)}>
                     <strong>{formatDate(run.createdAt)}</strong>
-                    <span>{run.id} · {formatBytes(run.bytesWritten)}</span>
+                    <span>{run.trigger === "scheduled" ? "agendado" : run.trigger === "retry" ? "retry" : "manual"} · {formatBytes(run.bytesWritten)}</span>
                   </button>
                 </div>
                 <StatusBadge status={run.status} />
