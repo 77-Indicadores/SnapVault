@@ -3,7 +3,8 @@ import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import bcrypt from "bcryptjs";
 import { basename } from "node:path";
-import { mkdir, rm } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { mkdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { config } from "./config.js";
@@ -565,6 +566,47 @@ app.get("/api/v1/runs/:id", { preHandler: requireAuth }, async (request) => {
     logs: db.logs.filter((item) => item.runId === params.id),
     artifacts: db.artifacts.filter((item) => item.runId === params.id)
   };
+});
+
+app.get("/api/v1/artifacts/:id/download", { preHandler: requireAuth }, async (request, reply) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const db = await store.read();
+  const artifact = db.artifacts.find((item) => item.id === params.id);
+  if (!artifact) { reply.status(404); return { error: "Artifact not found" }; }
+  const filename = artifact.path.split(/[\\/]/).pop() ?? "artifact";
+  reply.header("Content-Disposition", `attachment; filename="${filename}"`);
+  if (artifact.sizeBytes) reply.header("Content-Length", String(artifact.sizeBytes));
+  reply.header("Content-Type", "application/octet-stream");
+  if (artifact.path.startsWith("/")) {
+    await stat(artifact.path);
+    return reply.send(createReadStream(artifact.path));
+  }
+  const destination = db.destinations.find((item) => item.id === artifact.destinationId);
+  if (!destination) { reply.status(404); return { error: "Destination not found" }; }
+  if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
+    const { downloadMicrosoftDrivePath } = await import("./microsoftGraph.js");
+    const tmpDir = join(config.stagingDir, "downloads", params.id);
+    await mkdir(tmpDir, { recursive: true });
+    try {
+      const localFile = join(tmpDir, filename);
+      await downloadMicrosoftDrivePath(destination.config as any, artifact.path, localFile, await microsoftCredentials(String(destination.config.microsoftIntegrationId ?? "")));
+      const stream = createReadStream(localFile);
+      stream.on("close", () => rm(tmpDir, { recursive: true, force: true }));
+      return reply.send(stream);
+    } catch (err) {
+      await rm(tmpDir, { recursive: true, force: true });
+      throw err;
+    }
+  }
+  if (destination.config?.rcloneRemoteName) {
+    const { spawn } = await import("node:child_process");
+    const remote = `${destination.config.rcloneRemoteName}:${artifact.path}`;
+    const proc = spawn("rclone", ["cat", remote]);
+    proc.stderr.on("data", (chunk: Buffer) => request.log.warn("rclone cat stderr: " + chunk.toString()));
+    return reply.send(proc.stdout);
+  }
+  reply.status(422);
+  return { error: "Artifact is stored on a remote destination that does not support direct download" };
 });
 
 app.post("/api/v1/runs/:id/test-restore", { preHandler: requireAuth }, async (request) => {

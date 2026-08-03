@@ -8,6 +8,7 @@ import {
   Cloud,
   Copy,
   Database,
+  Download,
   FileArchive,
   FolderClock,
   HardDrive,
@@ -1178,17 +1179,18 @@ function RunDetail({ runId }: { runId: string }) {
       <ReviewRow label="Integridade" value={verificationLabel(detail.run)} />
       <ReviewRow label="Criado em" value={formatDate(detail.run.createdAt)} />
       <ReviewRow label="Tamanho" value={formatBytes(detail.run.bytesWritten)} />
-      <SectionHeader title="Arquivos" />
-      {!detail.artifacts.filter((a) => a.kind !== "manifest").length
-        ? <EmptyState compact title="Sem arquivos" text="A execucao ainda nao gerou artefatos." />
-        : detail.artifacts.filter((a) => a.kind !== "manifest").map((artifact) => (
+      <SectionHeader title="Artefatos" />
+      {!detail.artifacts.length
+        ? <EmptyState compact title="Sem artefatos" text="A execucao ainda nao gerou artefatos." />
+        : detail.artifacts.map((artifact) => (
             <div className="artifactRow" key={artifact.id}>
               <FileArchive size={16} />
               <div>
-                <strong>{artifact.kind === "postgres_dump" ? "Dump PostgreSQL" : artifact.kind === "minio_snapshot" ? "Snapshot MinIO" : artifact.path.split(/[\\/]/).pop() ?? artifact.kind}</strong>
+                <strong>{artifact.kind === "postgres_dump" ? "Dump PostgreSQL" : artifact.kind === "minio_snapshot" ? "Snapshot MinIO" : artifact.kind === "manifest" ? "Manifesto" : artifact.path.split(/[\\/]/).pop() ?? artifact.kind}</strong>
                 <span>{formatBytes(artifact.sizeBytes)}</span>
                 <span className="artifactPath">{artifact.path}</span>
               </div>
+              <a className="iconOnly artifactDownload" href={`/api/v1/artifacts/${artifact.id}/download`} download aria-label="Baixar artefato" title="Baixar artefato"><Download size={14} /></a>
             </div>
           ))
       }

@@ -922,9 +922,25 @@ input::placeholder { color: #999; }
   min-height: 62px;
   padding: 12px;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
+  grid-template-columns: 22px minmax(0, 1fr) auto;
   gap: 10px;
   align-items: start;
+}
+
+.artifactDownload {
+  color: var(--secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  padding: 4px;
+  border-radius: var(--radius);
+  transition: color 0.15s, background 0.15s;
+}
+
+.artifactDownload:hover {
+  color: var(--foreground);
+  background: var(--hover);
 }
 
 .artifactRow strong, .artifactRow span {
