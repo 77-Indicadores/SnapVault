@@ -164,6 +164,11 @@ app.post("/api/v1/auth/logout", async (request, reply) => {
 
 app.get("/api/v1/auth/me", { preHandler: requireAuth }, async (request) => ({ user: publicUser((request as any).user) }));
 
+app.post("/api/v1/admin/restart", { preHandler: requireAuth }, async (_request, reply) => {
+  reply.send({ ok: true, message: "Reiniciando servidor..." });
+  setTimeout(() => { app.log.warn("Reinicio solicitado pelo usuario via painel"); process.exit(0); }, 300);
+});
+
 app.get("/api/v1/settings", { preHandler: requireAuth }, async () => {
   const db = await store.read();
   return { timezone: db.settings?.timezone ?? "America/Sao_Paulo" };

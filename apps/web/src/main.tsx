@@ -441,6 +441,19 @@ function BetterstackPanel({ showNotice }: { showNotice: (notice: Notice) => void
     }
   };
 
+  const restart = async () => {
+    setBusy("restart");
+    try {
+      await api("/admin/restart", { method: "POST", body: "{}" });
+      showNotice({ tone: "success", text: "Servidor reiniciando... aguarde alguns segundos." });
+    } catch {
+      // processo encerra antes de responder — ignora erro de rede
+      showNotice({ tone: "success", text: "Servidor reiniciando... aguarde alguns segundos." });
+    } finally {
+      setBusy("");
+    }
+  };
+
   return (
     <section className="card">
       <SectionHeader title="BetterStack" />
@@ -457,7 +470,8 @@ function BetterstackPanel({ showNotice }: { showNotice: (notice: Notice) => void
       <footer className="wizardFooter" style={{ padding: "16px 0 0", borderTop: "1px solid var(--border)", marginTop: 16 }}>
         <div className="footerActions inline">
           <button className="secondaryButton" disabled={busy === "save" || (!token && !ingestingHost)} onClick={save}>{busy === "save" ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Salvar</button>
-          <button className="primaryButton" disabled={busy === "test" || !tokenSet} onClick={test}>{busy === "test" ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />} Testar integração</button>
+          <button className="secondaryButton" disabled={busy === "test" || !tokenSet} onClick={test}>{busy === "test" ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />} Testar integração</button>
+          <button className="primaryButton" disabled={busy === "restart"} onClick={restart}>{busy === "restart" ? <Loader2 className="spin" size={15} /> : <RotateCcw size={15} />} Reiniciar servidor</button>
         </div>
       </footer>
     </section>
