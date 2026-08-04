@@ -7,6 +7,7 @@ export const config = {
   stagingDir: process.env.SNAPVAULT_STAGING_DIR ?? resolve(process.cwd(), "../../staging"),
   cookieSecret: process.env.SNAPVAULT_SECRET_KEY ?? "dev-secret-change-me",
   webOrigin: process.env.SNAPVAULT_WEB_ORIGIN ?? "http://localhost:5173",
+  betterstackToken: process.env.BETTERSTACK_SOURCE_TOKEN ?? "",
   microsoft: {
     clientId: process.env.MS_CLIENT_ID ?? "",
     clientSecret: process.env.MS_CLIENT_SECRET ?? "",

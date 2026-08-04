@@ -767,6 +767,14 @@ code {
   gap: 12px;
 }
 
+.fieldHint {
+  font-style: normal;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--secondary);
+  margin-left: 6px;
+}
+
 .field span {
   color: var(--text);
   font-size: 13px;
