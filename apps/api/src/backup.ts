@@ -2,8 +2,7 @@ import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { join } from "node:path";
 import { createGzip } from "node:zlib";
-import { pipeline } from "node:stream/promises";
-import { Readable } from "node:stream";
+import { spawn } from "node:child_process";
 import { Store } from "./store.js";
 import { decryptText, sha256File } from "./crypto.js";
 import { commandExists, runCommand } from "./runner.js";
@@ -12,6 +11,36 @@ import type { BackupArtifact, BackupRun, Destination, JobLogEntry, Policy, Sourc
 import { deleteMicrosoftDrivePath, uploadToMicrosoftDrive } from "./microsoftGraph.js";
 import { verifyRestoreForRun } from "./restoreVerify.js";
 import { config } from "./config.js";
+
+/**
+ * Executa um comando cujo stdout pode ser arbitrariamente grande (pg_dump, pg_dumpall).
+ * Em vez de acumular em memória, redireciona stdout diretamente para um WriteStream.
+ * stderr é capturado normalmente (mensagens de erro são pequenas).
+ */
+function spawnToFile(command: string, args: string[], outStream: NodeJS.WritableStream, env: Record<string, string> = {}): Promise<{ code: number; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { env: { ...process.env, ...env }, shell: false });
+    let stderr = "";
+    child.stdout.pipe(outStream as any);
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString().slice(0, 65536); });
+    child.on("error", (err) => resolve({ code: 127, stderr: err.message }));
+    child.on("close", (code) => resolve({ code: code ?? 1, stderr }));
+  });
+}
+
+/**
+ * Executa um comando descartando stdout (mc cp, tar -czf) — apenas captura stderr e código de saída.
+ * Evita acumular megabytes de progresso/verbose em memória.
+ */
+function spawnIgnoreStdout(command: string, args: string[], env: Record<string, string> = {}): Promise<{ code: number; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { env: { ...process.env, ...env }, shell: false, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString().slice(0, 65536); });
+    child.on("error", (err) => resolve({ code: 127, stderr: err.message }));
+    child.on("close", (code) => resolve({ code: code ?? 1, stderr }));
+  });
+}
 
 type Logger = (level: JobLogEntry["level"], message: string, data?: Record<string, unknown>) => Promise<void>;
 
@@ -161,31 +190,44 @@ async function createSourceArtifact(source: Source, policy: Policy, runDir: stri
 }
 
 async function createPostgresDump(source: Source, policy: Policy, runDir: string, log: Logger) {
-  const out = join(runDir, policy.options.compression === "zstd" ? "dump.sql.zst" : "dump.sql.gz");
+  const useGzip = policy.options.compression !== "zstd";
+  const out = join(runDir, useGzip ? "dump.sql.gz" : "dump.sql.zst");
   const hasPgDump = await commandExists("pg_dump");
   if (!hasPgDump) {
     await log("warn", "pg_dump not found; writing development fixture");
     await writeFile(out, `-- SnapVault development dump\n-- source=${source.name}\n-- createdAt=${now()}\n`);
     return [out];
   }
-  const config = source.config as any;
+  const pgConfig = source.config as any;
   const scope = resolvePolicyScope(source, policy);
+  const pgEnv = { PGPASSWORD: source.secrets.password ?? "" };
+  const baseArgs = ["-h", String(pgConfig.host), "-p", String(pgConfig.port ?? 5432), "-U", String(pgConfig.username)];
+
+  // Streaming: stdout do pg_dump vai direto para arquivo (via gzip se necessário)
+  // Nunca passa por memória — evita RangeError em dumps grandes
+  const writeStream = createWriteStream(out);
+  const outStream = useGzip ? createGzip() : writeStream;
+  if (useGzip) (outStream as any).pipe(writeStream);
+
+  let result: { code: number; stderr: string };
   if (scope.mode === "all") {
-    const result = await runCommand("pg_dumpall", ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username)], { PGPASSWORD: source.secrets.password ?? "" });
-    if (result.code !== 0) throw new Error(result.stderr || "pg_dumpall failed");
-    if (policy.options.compression === "gzip") await pipeline(Readable.from([result.stdout]), createGzip(), createWriteStream(out));
-    else await writeFile(out, result.stdout);
-    return [out];
-  }
-  if (!scope.database) throw new Error("PostgreSQL backup routine has no database selected");
-  const args = ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username), String(scope.database)];
-  const result = await runCommand("pg_dump", args, { PGPASSWORD: source.secrets.password ?? "" });
-  if (result.code !== 0) throw new Error(result.stderr || "pg_dump failed");
-  if (policy.options.compression === "gzip") {
-    await pipeline(Readable.from([result.stdout]), createGzip(), createWriteStream(out));
+    await log("info", "Starting pg_dumpall (all databases)");
+    result = await spawnToFile("pg_dumpall", baseArgs, outStream, pgEnv);
   } else {
-    await writeFile(out, result.stdout);
+    if (!scope.database) throw new Error("PostgreSQL backup routine has no database selected");
+    await log("info", `Starting pg_dump for database "${scope.database}"`);
+    result = await spawnToFile("pg_dump", [...baseArgs, String(scope.database)], outStream, pgEnv);
   }
+
+  // Garante que o stream foi fechado antes de verificar o resultado
+  await new Promise<void>((resolve, reject) => {
+    writeStream.on("finish", resolve);
+    writeStream.on("error", reject);
+    if (!(outStream as any).writableEnded) (outStream as any).end();
+  });
+
+  if (result.code !== 0) throw new Error(result.stderr || "pg_dump failed");
+  await log("info", "pg_dump completed");
   return [out];
 }
 
@@ -206,10 +248,12 @@ async function createMinioSnapshot(source: Source, policy: Policy, runDir: strin
   if (aliasResult.code !== 0) throw new Error(aliasResult.stderr || "mc alias set failed");
   if (scope.mode !== "all" && !scope.bucket) throw new Error("MinIO backup routine has no bucket selected");
   const bucketPath = scope.mode === "all" ? "" : [String(scope.bucket), String(scope.prefix ?? "").replace(/^\/+|\/+$/g, "")].filter(Boolean).join("/");
-  const copyResult = await runCommand("mc", ["cp", "--recursive", `${alias}/${bucketPath}`, objectDir]);
+  // mc cp pode gerar stdout enorme (um log por objeto) — descarta stdout, captura apenas stderr
+  const copyResult = await spawnIgnoreStdout("mc", ["cp", "--recursive", `${alias}/${bucketPath}`, objectDir]);
   await runCommand("mc", ["alias", "remove", alias]);
   if (copyResult.code !== 0) throw new Error(copyResult.stderr || "mc copy failed");
-  const tarResult = await runCommand("tar", ["-czf", out, "-C", objectDir, "."]);
+  // tar: stdout vazio (escreve direto no arquivo), stderr pequeno
+  const tarResult = await spawnIgnoreStdout("tar", ["-czf", out, "-C", objectDir, "."]);
   if (tarResult.code !== 0) throw new Error(tarResult.stderr || "tar failed");
   await log("info", "MinIO snapshot created", { bucket: scope.mode === "all" ? "all" : scope.bucket, prefix: scope.prefix ?? "" });
   return [out];
