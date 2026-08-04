@@ -407,6 +407,7 @@ function BetterstackPanel({ showNotice }: { showNotice: (notice: Notice) => void
   const [ingestingHost, setIngestingHost] = useState("");
   const [tokenSet, setTokenSet] = useState(false);
   const [busy, setBusy] = useState("");
+  const [restarting, setRestarting] = useState(false);
 
   useEffect(() => {
     api("/integrations/betterstack").then((r) => {
@@ -443,15 +444,23 @@ function BetterstackPanel({ showNotice }: { showNotice: (notice: Notice) => void
 
   const restart = async () => {
     setBusy("restart");
+    setRestarting(true);
     try {
       await api("/admin/restart", { method: "POST", body: "{}" });
-      showNotice({ tone: "success", text: "Servidor reiniciando... aguarde alguns segundos." });
     } catch {
-      // processo encerra antes de responder — ignora erro de rede
-      showNotice({ tone: "success", text: "Servidor reiniciando... aguarde alguns segundos." });
+      // processo pode encerrar antes de responder — normal no graceful shutdown
     } finally {
       setBusy("");
     }
+    // Polling até o servidor voltar
+    const poll = async () => {
+      try {
+        const res = await fetch("/health");
+        if (res.ok) { setRestarting(false); showNotice({ tone: "success", text: "Servidor reiniciado e online." }); return; }
+      } catch { /* ainda offline */ }
+      setTimeout(poll, 1000);
+    };
+    setTimeout(poll, 1500); // aguarda o processo encerrar antes de começar a testar
   };
 
   return (
@@ -471,7 +480,7 @@ function BetterstackPanel({ showNotice }: { showNotice: (notice: Notice) => void
         <div className="footerActions inline">
           <button className="secondaryButton" disabled={busy === "save" || (!token && !ingestingHost)} onClick={save}>{busy === "save" ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Salvar</button>
           <button className="secondaryButton" disabled={busy === "test" || !tokenSet} onClick={test}>{busy === "test" ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />} Testar integração</button>
-          <button className="primaryButton" disabled={busy === "restart"} onClick={restart}>{busy === "restart" ? <Loader2 className="spin" size={15} /> : <RotateCcw size={15} />} Reiniciar servidor</button>
+          <button className="primaryButton" disabled={busy === "restart" || restarting} onClick={restart}>{restarting ? <><Loader2 className="spin" size={15} /> Aguardando...</> : busy === "restart" ? <><Loader2 className="spin" size={15} /> Reiniciando...</> : <><RotateCcw size={15} /> Reiniciar servidor</>}</button>
         </div>
       </footer>
     </section>

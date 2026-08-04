@@ -165,8 +165,8 @@ app.post("/api/v1/auth/logout", async (request, reply) => {
 app.get("/api/v1/auth/me", { preHandler: requireAuth }, async (request) => ({ user: publicUser((request as any).user) }));
 
 app.post("/api/v1/admin/restart", { preHandler: requireAuth }, async (_request, reply) => {
-  reply.send({ ok: true, message: "Reiniciando servidor..." });
-  setTimeout(() => { app.log.warn("Reinicio solicitado pelo usuario via painel"); process.exit(0); }, 300);
+  reply.send({ ok: true, message: "Graceful shutdown iniciado..." });
+  setImmediate(() => gracefulShutdown("restart solicitado pelo usuario via painel"));
 });
 
 app.get("/api/v1/settings", { preHandler: requireAuth }, async () => {
@@ -923,6 +923,27 @@ function startScheduler() {
     }
   }, 60_000);
 }
+
+async function gracefulShutdown(reason: string) {
+  app.log.warn({ reason }, "graceful shutdown iniciado");
+  const timeout = setTimeout(() => {
+    app.log.error("graceful shutdown timeout — forcando saida");
+    process.exit(1);
+  }, 5000);
+  try {
+    await app.close();
+    clearTimeout(timeout);
+    app.log.warn("servidor encerrado com sucesso");
+    process.exit(0);
+  } catch (err) {
+    clearTimeout(timeout);
+    app.log.error({ err }, "erro durante graceful shutdown");
+    process.exit(1);
+  }
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM recebido"));
+process.on("SIGINT",  () => gracefulShutdown("SIGINT recebido"));
 
 process.on("uncaughtException", (err) => {
   app.log.fatal({ err }, "uncaughtException — processo vai encerrar");
