@@ -12,6 +12,7 @@ services:
       SNAPVAULT_STAGING_DIR: /staging
       SNAPVAULT_WEB_ORIGIN: http://localhost:8080
       SNAPVAULT_SECRET_KEY: ${SNAPVAULT_SECRET_KEY:-local-dev-secret}
+      BETTERSTACK_SOURCE_TOKEN: ${BETTERSTACK_SOURCE_TOKEN:-}
     volumes:
       - snapvault-data:/data
       - snapvault-staging:/staging
@@ -19,8 +20,16 @@ services:
     ports:
       - "4000:4000"
     depends_on:
-      - postgres
-      - minio
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:4000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   web:
     build:
@@ -29,7 +38,8 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
   postgres:
     image: postgres:15-alpine
@@ -41,6 +51,12 @@ services:
       - "5432:5432"
     volumes:
       - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   minio:
     image: minio/minio:latest
@@ -53,6 +69,12 @@ services:
       - "9001:9001"
     volumes:
       - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
 
 volumes:
   snapvault-data:
