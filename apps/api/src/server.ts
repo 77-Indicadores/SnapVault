@@ -21,6 +21,7 @@ const store = new Store(config.databasePath);
 // Token: env var tem prioridade; fallback para o valor salvo no banco
 const dbForLogger = await store.read();
 const betterstackToken = config.betterstackToken || dbForLogger.settings?.betterstack?.token || "";
+const betterstackHost = dbForLogger.settings?.betterstack?.ingestingHost || "";
 
 const loggerOptions = betterstackToken
   ? {
@@ -28,7 +29,15 @@ const loggerOptions = betterstackToken
       transport: {
         targets: [
           { target: "pino/file", options: { destination: 1 }, level: "info" },
-          { target: "@logtail/pino", options: { sourceToken: betterstackToken }, level: "info" }
+          {
+            target: "@logtail/pino",
+            options: {
+              sourceToken: betterstackToken,
+              // Usa o ingesting host específico da source; fallback para o endpoint global
+              ...(betterstackHost ? { options: { endpoint: `https://${betterstackHost}` } } : {})
+            },
+            level: "info"
+          }
         ]
       }
     }
