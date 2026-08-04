@@ -18,13 +18,17 @@ import { runCommand } from "./runner.js";
 
 const store = new Store(config.databasePath);
 
-const loggerOptions = config.betterstackToken
+// Token: env var tem prioridade; fallback para o valor salvo no banco
+const dbForLogger = await store.read();
+const betterstackToken = config.betterstackToken || dbForLogger.settings?.betterstack?.token || "";
+
+const loggerOptions = betterstackToken
   ? {
       level: "info",
       transport: {
         targets: [
           { target: "pino/file", options: { destination: 1 }, level: "info" },
-          { target: "@logtail/pino", options: { sourceToken: config.betterstackToken }, level: "info" }
+          { target: "@logtail/pino", options: { sourceToken: betterstackToken }, level: "info" }
         ]
       }
     }
@@ -173,6 +177,36 @@ app.patch("/api/v1/settings", { preHandler: requireAuth }, async (request) => {
     return { timezone: db.settings.timezone };
   });
   return result;
+});
+
+app.get("/api/v1/integrations/betterstack", { preHandler: requireAuth }, async () => {
+  const db = await store.read();
+  const bs = db.settings?.betterstack;
+  return { configured: Boolean(bs?.token), ingestingHost: bs?.ingestingHost ?? "", tokenSet: Boolean(bs?.token) };
+});
+
+app.patch("/api/v1/integrations/betterstack", { preHandler: requireAuth }, async (request) => {
+  const body = z.object({ token: z.string(), ingestingHost: z.string() }).parse(request.body);
+  await store.update((db) => {
+    db.settings = db.settings ?? { timezone: "America/Sao_Paulo" };
+    db.settings.betterstack = { token: body.token, ingestingHost: body.ingestingHost };
+  });
+  return { ok: true };
+});
+
+app.post("/api/v1/integrations/betterstack/test", { preHandler: requireAuth }, async (request) => {
+  const db = await store.read();
+  const bs = db.settings?.betterstack;
+  if (!bs?.token || !bs?.ingestingHost) throw new Error("BetterStack nao configurado");
+  const url = `https://${bs.ingestingHost}`;
+  const payload = JSON.stringify({ dt: new Date().toISOString(), message: "Hello from SnapVault! Integracao BetterStack funcionando." });
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${bs.token}` },
+    body: payload
+  });
+  if (!res.ok) throw new Error(`BetterStack retornou ${res.status}`);
+  return { ok: true };
 });
 
 app.get("/api/v1/integrations/microsoft", { preHandler: requireAuth }, async () => {
