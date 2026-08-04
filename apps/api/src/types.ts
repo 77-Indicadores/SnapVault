@@ -141,6 +141,7 @@ export type Database = {
   settings?: {
     microsoft?: MicrosoftIntegration | null;
     timezone?: string;
+    betterstack?: { token: string; ingestingHost: string } | null;
   };
   microsoftIntegrations?: MicrosoftIntegration[];
   users: User[];

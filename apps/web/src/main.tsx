@@ -402,6 +402,68 @@ function BackupDetailPage({ data, policyId, onBack, onRun, onEdit, onRestore, on
   );
 }
 
+function BetterstackPanel({ showNotice }: { showNotice: (notice: Notice) => void }) {
+  const [token, setToken] = useState("");
+  const [ingestingHost, setIngestingHost] = useState("");
+  const [tokenSet, setTokenSet] = useState(false);
+  const [busy, setBusy] = useState("");
+
+  useEffect(() => {
+    api("/integrations/betterstack").then((r) => {
+      setTokenSet(r.tokenSet);
+      setIngestingHost(r.ingestingHost ?? "");
+    }).catch(() => {});
+  }, []);
+
+  const save = async () => {
+    setBusy("save");
+    try {
+      await api("/integrations/betterstack", { method: "PATCH", body: JSON.stringify({ token, ingestingHost }) });
+      setTokenSet(Boolean(token));
+      setToken("");
+      showNotice({ tone: "success", text: "BetterStack salvo." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const test = async () => {
+    setBusy("test");
+    try {
+      await api("/integrations/betterstack/test", { method: "POST", body: "{}" });
+      showNotice({ tone: "success", text: "Log de teste enviado ao BetterStack com sucesso." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <section className="card">
+      <SectionHeader title="BetterStack" />
+      <div className="settingsRow">
+        <div>
+          <strong>Logs e observabilidade</strong>
+          <span>Envia logs da API para o BetterStack Logtail em tempo real. O token e o host de ingestao estao disponiveis no painel do BetterStack em Logs → Sources.</span>
+        </div>
+      </div>
+      <div className="choiceGrid" style={{ marginTop: 12 }}>
+        <Field label={tokenSet ? "Token (definido — deixe vazio para manter)" : "Source Token"}><input type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder={tokenSet ? "••••••••••••••••" : "gVk..."} /></Field>
+        <Field label="Ingesting Host"><input value={ingestingHost} onChange={(e) => setIngestingHost(e.target.value)} placeholder="s1234567.eu-central-1a.betterstackdata.com" /></Field>
+      </div>
+      <footer className="wizardFooter" style={{ padding: "16px 0 0", borderTop: "1px solid var(--border)", marginTop: 16 }}>
+        <div className="footerActions inline">
+          <button className="secondaryButton" disabled={busy === "save" || (!token && !ingestingHost)} onClick={save}>{busy === "save" ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Salvar</button>
+          <button className="primaryButton" disabled={busy === "test" || !tokenSet} onClick={test}>{busy === "test" ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />} Testar integração</button>
+        </div>
+      </footer>
+    </section>
+  );
+}
+
 function StoragePage({ data, refresh, openCreate, openEdit, showNotice }: { data: AppData; refresh: () => Promise<void>; openCreate: () => void; openEdit: (destination: Destination) => void; showNotice: (notice: Notice) => void }) {
   const [busy, setBusy] = useState("");
   const dependencyCount = (id: string) => data.policies.filter((item) => item.destinationId === id).length + data.runs.filter((item) => item.destinationId === id).length;
@@ -615,6 +677,7 @@ function SettingsPage({ user, showNotice, timezone, onTimezoneChange }: { user: 
           </div>
         </section>
         <MicrosoftIntegrationsPanel showNotice={showNotice} />
+        <BetterstackPanel showNotice={showNotice} />
       </section>
     </>
   );
