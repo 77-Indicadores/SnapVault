@@ -17,7 +17,20 @@ import { verifyRestoreForRun } from "./restoreVerify.js";
 import { runCommand } from "./runner.js";
 
 const store = new Store(config.databasePath);
-const app = Fastify({ logger: true });
+
+const loggerOptions = config.betterstackToken
+  ? {
+      level: "info",
+      transport: {
+        targets: [
+          { target: "pino-pretty", options: { colorize: true }, level: "info" },
+          { target: "@logtail/pino", options: { sourceToken: config.betterstackToken }, level: "info" }
+        ]
+      }
+    }
+  : { level: "info" };
+
+const app = Fastify({ logger: loggerOptions as any });
 const scheduledKeys = new Set<string>();
 
 await app.register(cors, { origin: config.webOrigin, credentials: true });
@@ -748,7 +761,8 @@ function publicMicrosoftIntegrationSafe(integration: any) {
 async function testPostgresSource(source: any) {
   const sourceConfig = source.config as any;
   const env = { PGPASSWORD: source.secrets?.password ?? "" };
-  const args = ["-h", String(sourceConfig.host), "-p", String(sourceConfig.port ?? 5432), "-U", String(sourceConfig.username), "-d", "postgres", "-tAc", "select datname from pg_database where datallowconn and not datistemplate order by datname"];
+  const connectDb = String(sourceConfig.database || "template1");
+  const args = ["-h", String(sourceConfig.host), "-p", String(sourceConfig.port ?? 5432), "-U", String(sourceConfig.username), "-d", connectDb, "-tAc", "select datname from pg_database where datallowconn and not datistemplate order by datname"];
   const result = await runCommand("psql", args, env);
   if (result.code !== 0) throw new Error(result.stderr || "PostgreSQL connection failed");
   const databases = result.stdout.split("\n").map((item) => item.trim()).filter(Boolean);
@@ -869,6 +883,32 @@ function startScheduler() {
       app.log.error(error);
     }
   }, 60_000);
+}
+
+process.on("uncaughtException", (err) => {
+  app.log.fatal({ err }, "uncaughtException — processo vai encerrar");
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  app.log.fatal({ reason }, "unhandledRejection — processo vai encerrar");
+  process.exit(1);
+});
+
+// Ao iniciar, marcar como failed qualquer run preso em queued/running
+// (causado por crash do processo enquanto o backup estava em andamento)
+const stuckCount = await store.update((db) => {
+  const stuck = db.runs.filter((r) => r.status === "queued" || r.status === "running");
+  for (const run of stuck) {
+    run.status = "failed";
+    run.finishedAt = now();
+    run.errorCode = "PROCESS_CRASH";
+    run.errorMessage = "Execucao interrompida por reinicio inesperado do processo";
+  }
+  return stuck.length;
+});
+if (stuckCount > 0) {
+  app.log.warn({ stuckCount }, `boot: ${stuckCount} run(s) preso(s) marcado(s) como failed`);
 }
 
 await app.listen({ host: config.host, port: config.port });
