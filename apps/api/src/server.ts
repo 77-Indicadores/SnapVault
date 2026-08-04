@@ -21,6 +21,7 @@ const store = new Store(config.databasePath);
 // Token: env var tem prioridade; fallback para o valor salvo no banco
 const dbForLogger = await store.read();
 const betterstackToken = config.betterstackToken || dbForLogger.settings?.betterstack?.token || "";
+const betterstackHost = dbForLogger.settings?.betterstack?.ingestingHost || "";
 
 const loggerOptions = betterstackToken
   ? {
@@ -28,7 +29,15 @@ const loggerOptions = betterstackToken
       transport: {
         targets: [
           { target: "pino/file", options: { destination: 1 }, level: "info" },
-          { target: "@logtail/pino", options: { sourceToken: betterstackToken }, level: "info" }
+          {
+            target: "@logtail/pino",
+            options: {
+              sourceToken: betterstackToken,
+              // Usa o ingesting host específico da source; fallback para o endpoint global
+              ...(betterstackHost ? { options: { endpoint: `https://${betterstackHost}` } } : {})
+            },
+            level: "info"
+          }
         ]
       }
     }
@@ -163,6 +172,19 @@ app.post("/api/v1/auth/logout", async (request, reply) => {
 });
 
 app.get("/api/v1/auth/me", { preHandler: requireAuth }, async (request) => ({ user: publicUser((request as any).user) }));
+
+app.post("/api/v1/admin/restart", { preHandler: requireAuth }, async (_request, reply) => {
+  reply.send({ ok: true, message: "Reinicio solicitado..." });
+  setImmediate(() => {
+    if (process.send) {
+      // Modo cluster: delega o rolling restart ao master
+      process.send({ type: "restart" });
+    } else {
+      // Modo dev (sem master): shutdown normal
+      gracefulShutdown("restart solicitado pelo usuario via painel");
+    }
+  });
+});
 
 app.get("/api/v1/settings", { preHandler: requireAuth }, async () => {
   const db = await store.read();
@@ -919,6 +941,27 @@ function startScheduler() {
   }, 60_000);
 }
 
+async function gracefulShutdown(reason: string) {
+  app.log.warn({ reason }, "graceful shutdown iniciado");
+  const timeout = setTimeout(() => {
+    app.log.error("graceful shutdown timeout — forcando saida");
+    process.exit(1);
+  }, 5000);
+  try {
+    await app.close();
+    clearTimeout(timeout);
+    app.log.warn("servidor encerrado com sucesso");
+    process.exit(0);
+  } catch (err) {
+    clearTimeout(timeout);
+    app.log.error({ err }, "erro durante graceful shutdown");
+    process.exit(1);
+  }
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM recebido"));
+process.on("SIGINT",  () => gracefulShutdown("SIGINT recebido"));
+
 process.on("uncaughtException", (err) => {
   app.log.fatal({ err }, "uncaughtException — processo vai encerrar");
   process.exit(1);
@@ -947,14 +990,16 @@ if (stuckCount > 0) {
 
 await app.listen({ host: config.host, port: config.port });
 
-await store.update((db) => {
-  for (const run of db.runs) {
-    if (run.status === "running" || run.status === "queued") {
-      run.status = "failed";
-      run.errorCode = "server_restart";
-      run.errorMessage = "Execucao interrompida por reinicializacao do servidor.";
-      run.finishedAt = run.finishedAt ?? now();
-    }
+// Notifica o master que este worker está pronto para receber tráfego
+if (process.send) {
+  process.send({ type: "ready" });
+  app.log.info("[worker] sinal 'ready' enviado ao master");
+}
+
+// Escuta comando de shutdown vindo do master (rolling restart)
+process.on("message", (msg: any) => {
+  if (msg?.type === "shutdown") {
+    gracefulShutdown("shutdown solicitado pelo master (rolling restart)");
   }
 });
 
