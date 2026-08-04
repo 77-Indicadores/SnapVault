@@ -165,8 +165,16 @@ app.post("/api/v1/auth/logout", async (request, reply) => {
 app.get("/api/v1/auth/me", { preHandler: requireAuth }, async (request) => ({ user: publicUser((request as any).user) }));
 
 app.post("/api/v1/admin/restart", { preHandler: requireAuth }, async (_request, reply) => {
-  reply.send({ ok: true, message: "Graceful shutdown iniciado..." });
-  setImmediate(() => gracefulShutdown("restart solicitado pelo usuario via painel"));
+  reply.send({ ok: true, message: "Reinicio solicitado..." });
+  setImmediate(() => {
+    if (process.send) {
+      // Modo cluster: delega o rolling restart ao master
+      process.send({ type: "restart" });
+    } else {
+      // Modo dev (sem master): shutdown normal
+      gracefulShutdown("restart solicitado pelo usuario via painel");
+    }
+  });
 });
 
 app.get("/api/v1/settings", { preHandler: requireAuth }, async () => {
@@ -973,14 +981,16 @@ if (stuckCount > 0) {
 
 await app.listen({ host: config.host, port: config.port });
 
-await store.update((db) => {
-  for (const run of db.runs) {
-    if (run.status === "running" || run.status === "queued") {
-      run.status = "failed";
-      run.errorCode = "server_restart";
-      run.errorMessage = "Execucao interrompida por reinicializacao do servidor.";
-      run.finishedAt = run.finishedAt ?? now();
-    }
+// Notifica o master que este worker está pronto para receber tráfego
+if (process.send) {
+  process.send({ type: "ready" });
+  app.log.info("[worker] sinal 'ready' enviado ao master");
+}
+
+// Escuta comando de shutdown vindo do master (rolling restart)
+process.on("message", (msg: any) => {
+  if (msg?.type === "shutdown") {
+    gracefulShutdown("shutdown solicitado pelo master (rolling restart)");
   }
 });
 
