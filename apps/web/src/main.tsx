@@ -818,6 +818,7 @@ function SourceWizard({ source, onClose, onDone }: { source?: Source; onClose: (
   const [host, setHost] = useState(String(source?.config?.host ?? "postgres"));
   const [port, setPort] = useState(String(source?.config?.port ?? 5432));
   const [username, setUsername] = useState(String(source?.config?.username ?? "postgres"));
+  const [database, setDatabase] = useState(String(source?.config?.database ?? ""));
   const [password, setPassword] = useState("");
   const [endpoint, setEndpoint] = useState(String(source?.config?.endpoint ?? "http://minio:9000"));
   const [accessKey, setAccessKey] = useState("");
@@ -829,7 +830,7 @@ function SourceWizard({ source, onClose, onDone }: { source?: Source; onClose: (
 
   const buildBody = () => {
     const body: any = type === "postgres"
-      ? { name, type, config: { host, port: Number(port), username } }
+      ? { name, type, config: { host, port: Number(port), username, ...(database ? { database } : {}) } }
       : { name, type, config: { endpoint } };
     if (type === "postgres" && password) body.secrets = { password };
     if (type === "minio" && (accessKey || secretKey)) body.secrets = { accessKey, secretKey };
@@ -882,7 +883,7 @@ function SourceWizard({ source, onClose, onDone }: { source?: Source; onClose: (
           <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} /></Field>
           {type === "postgres" ? <>
             <div className="fieldPair"><Field label="Host"><input value={host} onChange={(e) => setHost(e.target.value)} /></Field><Field label="Porta"><input type="number" value={port} onChange={(e) => setPort(e.target.value)} /></Field></div>
-            <Field label="Usuario"><input value={username} onChange={(e) => setUsername(e.target.value)} /></Field>
+            <div className="fieldPair"><Field label="Usuario"><input value={username} onChange={(e) => setUsername(e.target.value)} /></Field><Field label="Database de conexao" hint="Opcional. Usado para listar databases. Deixe vazio para usar template1."><input value={database} onChange={(e) => setDatabase(e.target.value)} placeholder="template1" /></Field></div>
             <Field label={source ? "Senha nova opcional" : "Senha"}><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
           </> : <>
             <Field label="Endpoint"><input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} /></Field>
@@ -1376,8 +1377,8 @@ function SectionHeader({ title, action }: { title: string; action?: React.ReactN
   return <div className="sectionHeader"><h2>{title}</h2>{action}</div>;
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label className="field"><span>{label}</span>{children}</label>;
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return <label className="field"><span>{label}{hint && <em className="fieldHint">{hint}</em>}</span>{children}</label>;
 }
 
 function ChoiceGrid({ children }: { children: React.ReactNode }) {

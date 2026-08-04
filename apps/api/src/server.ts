@@ -761,7 +761,8 @@ function publicMicrosoftIntegrationSafe(integration: any) {
 async function testPostgresSource(source: any) {
   const sourceConfig = source.config as any;
   const env = { PGPASSWORD: source.secrets?.password ?? "" };
-  const args = ["-h", String(sourceConfig.host), "-p", String(sourceConfig.port ?? 5432), "-U", String(sourceConfig.username), "-d", "postgres", "-tAc", "select datname from pg_database where datallowconn and not datistemplate order by datname"];
+  const connectDb = String(sourceConfig.database || "template1");
+  const args = ["-h", String(sourceConfig.host), "-p", String(sourceConfig.port ?? 5432), "-U", String(sourceConfig.username), "-d", connectDb, "-tAc", "select datname from pg_database where datallowconn and not datistemplate order by datname"];
   const result = await runCommand("psql", args, env);
   if (result.code !== 0) throw new Error(result.stderr || "PostgreSQL connection failed");
   const databases = result.stdout.split("\n").map((item) => item.trim()).filter(Boolean);
