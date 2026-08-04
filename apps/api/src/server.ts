@@ -23,7 +23,7 @@ const loggerOptions = config.betterstackToken
       level: "info",
       transport: {
         targets: [
-          { target: "pino-pretty", options: { colorize: true }, level: "info" },
+          { target: "pino/file", options: { destination: 1 }, level: "info" },
           { target: "@logtail/pino", options: { sourceToken: config.betterstackToken }, level: "info" }
         ]
       }
