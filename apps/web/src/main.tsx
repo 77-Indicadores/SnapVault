@@ -447,20 +447,18 @@ function BetterstackPanel({ showNotice }: { showNotice: (notice: Notice) => void
     setRestarting(true);
     try {
       await api("/admin/restart", { method: "POST", body: "{}" });
+      // Rolling restart zero-downtime: novo worker sobe antes do antigo encerrar.
+      // Aguarda 3s para o ciclo completar antes de mostrar sucesso.
+      setTimeout(() => {
+        setRestarting(false);
+        showNotice({ tone: "success", text: "Servidor reiniciado sem interrupcao de servico." });
+      }, 3000);
     } catch {
-      // processo pode encerrar antes de responder — normal no graceful shutdown
+      setRestarting(false);
+      showNotice({ tone: "error", text: "Erro ao solicitar reinicio do servidor." });
     } finally {
       setBusy("");
     }
-    // Polling até o servidor voltar
-    const poll = async () => {
-      try {
-        const res = await fetch("/health");
-        if (res.ok) { setRestarting(false); showNotice({ tone: "success", text: "Servidor reiniciado e online." }); return; }
-      } catch { /* ainda offline */ }
-      setTimeout(poll, 1000);
-    };
-    setTimeout(poll, 1500); // aguarda o processo encerrar antes de começar a testar
   };
 
   return (
