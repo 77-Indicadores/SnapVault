@@ -2,6 +2,7 @@ import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { join } from "node:path";
 import { createGzip } from "node:zlib";
+import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
 import { Store } from "./store.js";
 import { decryptText, sha256File } from "./crypto.js";
@@ -13,23 +14,7 @@ import { verifyRestoreForRun } from "./restoreVerify.js";
 import { config } from "./config.js";
 
 /**
- * Executa um comando cujo stdout pode ser arbitrariamente grande (pg_dump, pg_dumpall).
- * Em vez de acumular em memória, redireciona stdout diretamente para um WriteStream.
- * stderr é capturado normalmente (mensagens de erro são pequenas).
- */
-function spawnToFile(command: string, args: string[], outStream: NodeJS.WritableStream, env: Record<string, string> = {}): Promise<{ code: number; stderr: string }> {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { env: { ...process.env, ...env }, shell: false });
-    let stderr = "";
-    child.stdout.pipe(outStream as any);
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString().slice(0, 65536); });
-    child.on("error", (err) => resolve({ code: 127, stderr: err.message }));
-    child.on("close", (code) => resolve({ code: code ?? 1, stderr }));
-  });
-}
-
-/**
- * Executa um comando descartando stdout (mc cp, tar -czf) — apenas captura stderr e código de saída.
+ * Executa um comando descartando stdout (mc cp, tar -czf) — apenas captura stderr e exit code.
  * Evita acumular megabytes de progresso/verbose em memória.
  */
 function spawnIgnoreStdout(command: string, args: string[], env: Record<string, string> = {}): Promise<{ code: number; stderr: string }> {
@@ -40,6 +25,14 @@ function spawnIgnoreStdout(command: string, args: string[], env: Record<string, 
     child.on("error", (err) => resolve({ code: 127, stderr: err.message }));
     child.on("close", (code) => resolve({ code: code ?? 1, stderr }));
   });
+}
+
+/** Retorna true se o destino armazena remotamente (não é storage local em staging). */
+function isRemoteDestination(destination: Destination): boolean {
+  return (
+    ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config?.mode === "graph") ||
+    Boolean(destination.config?.rcloneRemoteName)
+  );
 }
 
 type Logger = (level: JobLogEntry["level"], message: string, data?: Record<string, unknown>) => Promise<void>;
@@ -70,8 +63,8 @@ export async function executeBackupRun(store: Store, runId: string, stagingRoot:
     });
   };
 
+  const runDir = join(stagingRoot, runId);
   try {
-    const runDir = join(stagingRoot, runId);
     await mkdir(runDir, { recursive: true });
     await log("info", "Starting backup run");
     const produced = await createSourceArtifact(source, policy, runDir, log);
@@ -102,6 +95,14 @@ export async function executeBackupRun(store: Store, runId: string, stagingRoot:
   } catch (error: any) {
     await log("error", "Backup failed", { error: error.message });
     await failRun(store, run, "BACKUP_FAILED", error.message, startedAt);
+  } finally {
+    // Destinos remotos: arquivos locais foram enviados, limpa staging.
+    // Destinos locais: staging É o storage — mantém os arquivos, mas remove objectDir do MinIO.
+    if (isRemoteDestination(destination)) {
+      await rm(runDir, { recursive: true, force: true }).catch(() => {});
+    } else {
+      await rm(join(runDir, "objects"), { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
@@ -200,34 +201,45 @@ async function createPostgresDump(source: Source, policy: Policy, runDir: string
   }
   const pgConfig = source.config as any;
   const scope = resolvePolicyScope(source, policy);
+  if (scope.mode !== "all" && !scope.database) throw new Error("PostgreSQL backup routine has no database selected");
   const pgEnv = { PGPASSWORD: source.secrets.password ?? "" };
   const baseArgs = ["-h", String(pgConfig.host), "-p", String(pgConfig.port ?? 5432), "-U", String(pgConfig.username)];
+  const [cmd, args] = scope.mode === "all"
+    ? ["pg_dumpall", baseArgs]
+    : ["pg_dump", [...baseArgs, String(scope.database)]];
 
-  // Streaming: stdout do pg_dump vai direto para arquivo (via gzip se necessário)
-  // Nunca passa por memória — evita RangeError em dumps grandes
-  const writeStream = createWriteStream(out);
-  const outStream = useGzip ? createGzip() : writeStream;
-  if (useGzip) (outStream as any).pipe(writeStream);
+  await log("info", `Starting ${cmd}${scope.mode !== "all" ? ` for database "${scope.database}"` : " (all databases)"}`);
 
-  let result: { code: number; stderr: string };
-  if (scope.mode === "all") {
-    await log("info", "Starting pg_dumpall (all databases)");
-    result = await spawnToFile("pg_dumpall", baseArgs, outStream, pgEnv);
-  } else {
-    if (!scope.database) throw new Error("PostgreSQL backup routine has no database selected");
-    await log("info", `Starting pg_dump for database "${scope.database}"`);
-    result = await spawnToFile("pg_dump", [...baseArgs, String(scope.database)], outStream, pgEnv);
+  const child = spawn(cmd, args, { env: { ...process.env, ...pgEnv }, shell: false });
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString().slice(0, 65536); });
+
+  // Registra o exit code ANTES de aguardar o pipeline — "close" pode disparar
+  // antes do pipeline resolver, então não podemos usar child.on() depois do await.
+  const exitCodeP = new Promise<number>((resolve) => child.on("close", (code) => resolve(code ?? 1)));
+
+  // pipeline() gerencia corretamente end/error/cleanup em todos os streams.
+  // Qualquer erro de I/O propaga como exceção e fecha todos os streams envolvidos.
+  try {
+    const fileStream = createWriteStream(out);
+    if (useGzip) {
+      await pipeline(child.stdout, createGzip(), fileStream);
+    } else {
+      await pipeline(child.stdout, fileStream);
+    }
+  } catch (err: any) {
+    // Stream falhou — apaga o arquivo parcial para não confundir verifyLocalArtifacts
+    await rm(out, { force: true }).catch(() => {});
+    throw new Error(stderr || err.message || `${cmd} stream failed`);
   }
 
-  // Garante que o stream foi fechado antes de verificar o resultado
-  await new Promise<void>((resolve, reject) => {
-    writeStream.on("finish", resolve);
-    writeStream.on("error", reject);
-    if (!(outStream as any).writableEnded) (outStream as any).end();
-  });
+  const exitCode = await exitCodeP;
+  if (exitCode !== 0) {
+    await rm(out, { force: true }).catch(() => {});
+    throw new Error(stderr || `${cmd} exited with code ${exitCode}`);
+  }
 
-  if (result.code !== 0) throw new Error(result.stderr || "pg_dump failed");
-  await log("info", "pg_dump completed");
+  await log("info", `${cmd} completed`);
   return [out];
 }
 
@@ -254,6 +266,8 @@ async function createMinioSnapshot(source: Source, policy: Policy, runDir: strin
   if (copyResult.code !== 0) throw new Error(copyResult.stderr || "mc copy failed");
   // tar: stdout vazio (escreve direto no arquivo), stderr pequeno
   const tarResult = await spawnIgnoreStdout("tar", ["-czf", out, "-C", objectDir, "."]);
+  // objectDir não é mais necessário após o tar — limpa imediatamente
+  await rm(objectDir, { recursive: true, force: true }).catch(() => {});
   if (tarResult.code !== 0) throw new Error(tarResult.stderr || "tar failed");
   await log("info", "MinIO snapshot created", { bucket: scope.mode === "all" ? "all" : scope.bucket, prefix: scope.prefix ?? "" });
   return [out];

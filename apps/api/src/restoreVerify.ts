@@ -120,7 +120,9 @@ async function verifyPostgresRestore(source: Source, policy: any, runId: string,
   const created = await runCommand("createdb", ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username), database], env);
   if (created.code !== 0) throw new Error(created.stderr || "temporary restore database creation failed");
   try {
-    const restore = await runCommand("sh", ["-lc", `gzip -cd "$1" | psql -h "$2" -p "$3" -U "$4" -d "$5" >/tmp/snapvault-restore-${runId}.log` , "sh", localFile, String(config.host), String(config.port ?? 5432), String(config.username), database], env);
+    // Redireciona stdout do psql para /dev/null (pode ser grande em dumps verbosos).
+    // stderr é capturado pelo runCommand para mensagens de erro.
+    const restore = await runCommand("sh", ["-c", `gzip -cd "$1" | psql -h "$2" -p "$3" -U "$4" -d "$5" >/dev/null`, "sh", localFile, String(config.host), String(config.port ?? 5432), String(config.username), database], env);
     if (restore.code !== 0) throw new Error(restore.stderr || "postgres restore failed");
     const probe = await runCommand("psql", ["-h", String(config.host), "-p", String(config.port ?? 5432), "-U", String(config.username), "-d", database, "-tAc", "select count(*) from pg_class where relkind in ('r','v','m','S','f','p')"], env);
     if (probe.code !== 0) throw new Error(probe.stderr || "postgres restore validation failed");
@@ -149,10 +151,12 @@ async function verifyMinioRestore(localFile: string, verifyDir: string, log: Log
   if (gzip.code !== 0) throw new Error(gzip.stderr || "minio snapshot gzip check failed");
   const tar = await runCommand("tar", ["-xzf", localFile, "-C", extractDir]);
   if (tar.code !== 0) throw new Error(tar.stderr || "minio snapshot extraction failed");
-  const count = await runCommand("find", [extractDir, "-type", "f"]);
+  // Conta arquivos sem acumular nomes em memória — find -printf "." imprime um ponto
+  // por arquivo, o wc -c conta os bytes (= número de arquivos). Seguro para qualquer volume.
+  const count = await runCommand("sh", ["-c", `find "$1" -type f -printf '.' | wc -c`, "sh", extractDir]);
   if (count.code !== 0) throw new Error(count.stderr || "minio snapshot file listing failed");
-  const files = count.stdout.split("\n").map((item) => item.trim()).filter(Boolean);
-  if (!files.length) throw new Error("minio snapshot contains no files");
-  await log("info", "MinIO snapshot restore verified in temporary workspace", { files: files.length });
-  return files.length;
+  const fileCount = Number(count.stdout.trim());
+  if (!Number.isFinite(fileCount) || fileCount <= 0) throw new Error("minio snapshot contains no files");
+  await log("info", "MinIO snapshot restore verified in temporary workspace", { files: fileCount });
+  return fileCount;
 }
