@@ -8,11 +8,14 @@ services:
     environment:
       PORT: 4000
       HOST: 0.0.0.0
-      SNAPVAULT_DATABASE_PATH: /data/snapvault.json
       SNAPVAULT_STAGING_DIR: /staging
       SNAPVAULT_WEB_ORIGIN: http://localhost:8080
       SNAPVAULT_SECRET_KEY: ${SNAPVAULT_SECRET_KEY:-local-dev-secret}
       BETTERSTACK_SOURCE_TOKEN: ${BETTERSTACK_SOURCE_TOKEN:-}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      SNAPVAULT_DB: snapvault
     volumes:
       - snapvault-data:/data
       - snapvault-staging:/staging

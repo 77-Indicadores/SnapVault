@@ -697,10 +697,179 @@ function SettingsPage({ user, showNotice, timezone, onTimezoneChange }: { user: 
             </div>
           </div>
         </section>
+        <UsersPanel showNotice={showNotice} currentUser={user} />
+        <MyAccountPanel showNotice={showNotice} currentUser={user} />
         <MicrosoftIntegrationsPanel showNotice={showNotice} />
         <BetterstackPanel showNotice={showNotice} />
       </section>
     </>
+  );
+}
+
+type UserRecord = { id: string; name: string; email: string; role: string; createdAt?: string };
+
+function RoleBadge({ role }: { role: string }) {
+  const colors: Record<string, string> = { admin: "#ef4444", operator: "#f59e0b", viewer: "#6b7280" };
+  return (
+    <span style={{ background: colors[role] ?? "#6b7280", color: "#fff", borderRadius: 4, padding: "1px 7px", fontSize: 11, fontWeight: 600, textTransform: "uppercase" }}>{role}</span>
+  );
+}
+
+function UsersPanel({ showNotice, currentUser }: { showNotice: (n: Notice) => void; currentUser: any }) {
+  const [users, setUsers] = useState<UserRecord[]>([]);
+  const [showForm, setShowForm] = useState(false);
+  const [editingUser, setEditingUser] = useState<UserRecord | null>(null);
+  const [busy, setBusy] = useState("");
+  // form fields
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState("viewer");
+
+  if (currentUser?.role !== "admin") return null;
+
+  const load = async () => {
+    try {
+      const res = await api("/users");
+      setUsers(res.users ?? []);
+    } catch {}
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const openCreate = () => {
+    setEditingUser(null);
+    setName(""); setEmail(""); setPassword(""); setRole("viewer");
+    setShowForm(true);
+  };
+
+  const openEdit = (u: UserRecord) => {
+    setEditingUser(u);
+    setName(u.name); setEmail(u.email); setPassword(""); setRole(u.role);
+    setShowForm(true);
+  };
+
+  const save = async () => {
+    setBusy("save");
+    try {
+      if (editingUser) {
+        await api(`/users/${editingUser.id}`, { method: "PATCH", body: JSON.stringify({ name, email, role }) });
+        showNotice({ tone: "success", text: "Usuario atualizado." });
+      } else {
+        await api("/users", { method: "POST", body: JSON.stringify({ name, email, password, role }) });
+        showNotice({ tone: "success", text: "Usuario criado." });
+      }
+      setShowForm(false);
+      await load();
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const deleteUser = async (u: UserRecord) => {
+    if (!confirm(`Remover usuario ${u.name}?`)) return;
+    setBusy(u.id);
+    try {
+      await api(`/users/${u.id}`, { method: "DELETE" });
+      showNotice({ tone: "success", text: "Usuario removido." });
+      await load();
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <section className="sectionBlock settingsPanel">
+      <SectionHeader title="Gestao de usuarios" action={<button className="secondaryButton small" onClick={openCreate}><Plus size={14} /> Novo usuario</button>} />
+      {showForm && (
+        <div className="formGrid" style={{ marginBottom: 12 }}>
+          <Field label="Nome"><input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome completo" /></Field>
+          <Field label="Email"><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email@empresa.com" /></Field>
+          {!editingUser && <Field label="Senha (min 8 chars)"><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></Field>}
+          <Field label="Perfil">
+            <select value={role} onChange={(e) => setRole(e.target.value)}>
+              <option value="admin">admin</option>
+              <option value="operator">operator</option>
+              <option value="viewer">viewer</option>
+            </select>
+          </Field>
+          <div className="footerActions" style={{ gridColumn: "1/-1" }}>
+            <button className="secondaryButton" onClick={() => setShowForm(false)}>Cancelar</button>
+            <button className="primaryButton" disabled={busy === "save" || !name || !email || (!editingUser && !password)} onClick={save}>
+              {busy === "save" ? <Loader2 className="spin" size={15} /> : <Check size={15} />}
+              {editingUser ? "Salvar" : "Criar"}
+            </button>
+          </div>
+        </div>
+      )}
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+        <thead>
+          <tr style={{ borderBottom: "1px solid var(--border)" }}>
+            <th style={{ textAlign: "left", padding: "6px 8px", fontWeight: 600 }}>Nome</th>
+            <th style={{ textAlign: "left", padding: "6px 8px", fontWeight: 600 }}>Email</th>
+            <th style={{ textAlign: "left", padding: "6px 8px", fontWeight: 600 }}>Perfil</th>
+            <th style={{ padding: "6px 8px" }}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {users.map((u) => (
+            <tr key={u.id} style={{ borderBottom: "1px solid var(--border-light, #f1f5f9)" }}>
+              <td style={{ padding: "6px 8px" }}>{u.name}{u.id === currentUser.id && <span style={{ marginLeft: 6, fontSize: 10, color: "var(--muted)" }}>(voce)</span>}</td>
+              <td style={{ padding: "6px 8px", color: "var(--muted)" }}>{u.email}</td>
+              <td style={{ padding: "6px 8px" }}><RoleBadge role={u.role} /></td>
+              <td style={{ padding: "6px 8px", textAlign: "right", whiteSpace: "nowrap" }}>
+                <button className="secondaryButton small" style={{ marginRight: 4 }} onClick={() => openEdit(u)}><Pencil size={13} /></button>
+                <button className="secondaryButton small" disabled={busy === u.id || u.id === currentUser.id} onClick={() => deleteUser(u)}>
+                  {busy === u.id ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+function MyAccountPanel({ showNotice, currentUser }: { showNotice: (n: Notice) => void; currentUser: any }) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const changePassword = async () => {
+    setBusy(true);
+    try {
+      const payload: any = { newPassword };
+      if (currentUser.role !== "admin") payload.currentPassword = currentPassword;
+      await api(`/users/${currentUser.id}/password`, { method: "POST", body: JSON.stringify(payload) });
+      showNotice({ tone: "success", text: "Senha atualizada." });
+      setCurrentPassword(""); setNewPassword("");
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="sectionBlock settingsPanel">
+      <SectionHeader title="Minha conta" />
+      <div className="formGrid">
+        {currentUser.role !== "admin" && (
+          <Field label="Senha atual"><input type="password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} /></Field>
+        )}
+        <Field label="Nova senha (min 8 chars)"><input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} /></Field>
+      </div>
+      <div className="footerActions">
+        <button className="primaryButton" disabled={busy || !newPassword || newPassword.length < 8 || (currentUser.role !== "admin" && !currentPassword)} onClick={changePassword}>
+          {busy ? <Loader2 className="spin" size={15} /> : <KeyRound size={15} />} Alterar senha
+        </button>
+      </div>
+    </section>
   );
 }
 

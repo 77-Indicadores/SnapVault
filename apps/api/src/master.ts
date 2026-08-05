@@ -6,6 +6,15 @@ const WORKER_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "server.js")
 const HEALTH_TIMEOUT_MS = 30_000; // max wait for new worker to be ready
 const SHUTDOWN_GRACE_MS = 5_000;  // max wait for old worker to drain
 
+// Backoff exponencial para crashes rápidos — evita loop infinito que
+// corromperia dados ou sobrecarregaria o sistema.
+const CRASH_WINDOW_MS = 10_000; // janela para detectar crash rápido
+const MAX_CRASHES     = 5;      // crashes rápidos antes de parar
+const MAX_DELAY_MS    = 30_000; // delay máximo entre tentativas
+
+let crashCount  = 0;
+let lastCrashAt = 0;
+
 cluster.setupPrimary({ exec: WORKER_SCRIPT });
 
 let current = forkWorker();
@@ -24,11 +33,21 @@ function forkWorker(): ReturnType<typeof cluster.fork> {
 
 cluster.on("exit", (worker, code, signal) => {
   console.log(`[master] worker ${worker.process.pid} encerrou (code=${code} signal=${signal})`);
-  if (!restarting && worker.id === current.id) {
-    // Worker caiu inesperadamente — refork imediato
-    console.log("[master] worker caiu inesperadamente — reiniciando");
-    current = forkWorker();
+  if (restarting || worker.id !== current.id) return;
+
+  const now = Date.now();
+  const isQuickCrash = (now - lastCrashAt) < CRASH_WINDOW_MS;
+  lastCrashAt = now;
+  crashCount  = isQuickCrash ? crashCount + 1 : 1;
+
+  if (crashCount > MAX_CRASHES) {
+    console.error(`[master] worker crashou ${crashCount}x em menos de ${CRASH_WINDOW_MS / 1000}s — encerrando master para evitar loop destrutivo`);
+    process.exit(1); // Docker/Coolify reinicia o container com política de restart
   }
+
+  const delay = Math.min(1000 * 2 ** (crashCount - 1), MAX_DELAY_MS);
+  console.log(`[master] worker caiu inesperadamente (crash #${crashCount}) — reiniciando em ${delay}ms`);
+  setTimeout(() => { current = forkWorker(); }, delay);
 });
 
 async function handleRestart() {
