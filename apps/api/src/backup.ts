@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { createGzip } from "node:zlib";
 import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
-import { Store } from "./store.js";
+import type { AppDb } from "./db.js";
 import { decryptText, sha256File } from "./crypto.js";
 import { commandExists, runCommand } from "./runner.js";
 import { id, now } from "./ids.js";
@@ -39,28 +39,19 @@ type Logger = (level: JobLogEntry["level"], message: string, data?: Record<strin
 
 const slug = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "source";
 
-export async function executeBackupRun(store: Store, runId: string, stagingRoot: string) {
-  const db = await store.read();
-  const run = db.runs.find((item) => item.id === runId);
+export async function executeBackupRun(db: AppDb, runId: string, stagingRoot: string) {
+  const run = await db.getRun(runId);
   if (!run) return;
-  const policy = db.policies.find((item) => item.id === run.policyId);
-  const source = db.sources.find((item) => item.id === run.sourceId);
-  const destination = db.destinations.find((item) => item.id === run.destinationId);
-  if (!policy || !source || !destination) return failRun(store, run, "RUN_CONTEXT_MISSING", "Policy, source or destination not found");
+  const policy = await db.getPolicy(run.policyId);
+  const source = await db.getSource(run.sourceId);
+  const destination = await db.getDestination(run.destinationId);
+  if (!policy || !source || !destination) return failRun(db, run, "RUN_CONTEXT_MISSING", "Policy, source or destination not found");
 
   const startedAt = now();
-  await store.update((next) => {
-    const target = next.runs.find((item) => item.id === runId);
-    if (target) {
-      target.status = "running";
-      target.startedAt = startedAt;
-    }
-  });
+  await db.updateRun(runId, { status: "running", startedAt });
 
   const log: Logger = async (level, message, data) => {
-    await store.update((next) => {
-      next.logs.push({ id: id("log"), runId, level, message, data, createdAt: now() });
-    });
+    await db.addLog({ id: id("log"), runId, level, message, data, createdAt: now() });
   };
 
   const runDir = join(stagingRoot, runId);
@@ -70,31 +61,29 @@ export async function executeBackupRun(store: Store, runId: string, stagingRoot:
     const produced = await createSourceArtifact(source, policy, runDir, log);
     await verifyLocalArtifacts(source, produced, log);
     const manifestPath = await writeManifest(run, source, policy, produced, runDir);
-    const uploaded = await uploadArtifacts(destination, source, run, [...produced, manifestPath], log, getMicrosoftCredentials(db, String(destination.config.microsoftIntegrationId ?? "")));
+    const microsoftCreds = await getMicrosoftCredentials(db, String(destination.config.microsoftIntegrationId ?? ""));
+    const uploaded = await uploadArtifacts(destination, source, run, [...produced, manifestPath], log, microsoftCreds);
     const finishedAt = now();
     const totalBytes = uploaded.reduce((sum, item) => sum + (item.sizeBytes ?? 0), 0);
-    await store.update((next) => {
-      const target = next.runs.find((item) => item.id === runId);
-      if (target) {
-        target.status = "verified";
-        target.finishedAt = finishedAt;
-        target.durationMs = Date.parse(finishedAt) - Date.parse(startedAt);
-        target.bytesWritten = totalBytes;
-        target.verificationStatus = "integrity_verified";
-        target.verifiedAt = finishedAt;
-      }
-      next.artifacts.push(...uploaded);
+    await db.updateRun(runId, {
+      status: "verified",
+      finishedAt,
+      durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
+      bytesWritten: totalBytes,
+      verificationStatus: "integrity_verified",
+      verifiedAt: finishedAt,
     });
+    await db.createArtifacts(uploaded);
     await log("info", "Backup verified and uploaded", { bytesWritten: totalBytes, verificationStatus: "integrity_verified" });
-    await verifyRestoreForRun(store, runId, stagingRoot);
+    await verifyRestoreForRun(db, runId, stagingRoot);
     try {
-      await applyRetention(store, policy, destination, log);
+      await applyRetention(db, policy, destination, log);
     } catch (error: any) {
       await log("warn", "Retention cleanup failed", { error: error.message });
     }
   } catch (error: any) {
     await log("error", "Backup failed", { error: error.message });
-    await failRun(store, run, "BACKUP_FAILED", error.message, startedAt);
+    await failRun(db, run, "BACKUP_FAILED", error.message, startedAt);
   } finally {
     // Destinos remotos: arquivos locais foram enviados, limpa staging.
     // Destinos locais: staging É o storage — mantém os arquivos, mas remove objectDir do MinIO.
@@ -106,16 +95,16 @@ export async function executeBackupRun(store: Store, runId: string, stagingRoot:
   }
 }
 
-async function applyRetention(store: Store, policy: Policy, destination: Destination, log: Logger) {
+async function applyRetention(db: AppDb, policy: Policy, destination: Destination, log: Logger) {
   if (destination.status === "archived") {
     await log("warn", "Retention skipped because destination is archived");
     return;
   }
-  const db = await store.read();
-  const microsoftCredentials = getMicrosoftCredentials(db, String(destination.config.microsoftIntegrationId ?? ""));
+  const microsoftCredentials = await getMicrosoftCredentials(db, String(destination.config.microsoftIntegrationId ?? ""));
   const keepLast = Math.max(1, policy.retention.keepLast);
   const keepDays = Math.max(0, policy.retention.keepDays);
-  const policyRuns = db.runs
+  const allRuns = await db.listRuns();
+  const policyRuns = allRuns
     .filter((item) => item.policyId === policy.id && (item.status === "success" || item.status === "verified" || item.status === "recoverable"))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const protectedIds = new Set(policyRuns.slice(0, keepLast).map((item) => item.id));
@@ -128,17 +117,19 @@ async function applyRetention(store: Store, policy: Policy, destination: Destina
     return;
   }
 
-  const deleteRunIds = new Set(deleteRuns.map((item) => item.id));
-  const deleteArtifacts = db.artifacts.filter((item) => deleteRunIds.has(item.runId));
-  for (const artifact of deleteArtifacts) {
+  const deleteRunIds = deleteRuns.map((item) => item.id);
+  const deleteArtifacts = await db.listArtifacts();
+  const toDelete = deleteArtifacts.filter((item) => deleteRunIds.includes(item.runId));
+  for (const artifact of toDelete) {
     await deleteArtifact(destination, artifact.path, microsoftCredentials);
   }
-  await store.update((next) => {
-    next.artifacts = next.artifacts.filter((item) => !deleteRunIds.has(item.runId));
-    next.logs = next.logs.filter((item) => !deleteRunIds.has(item.runId));
-    next.runs = next.runs.filter((item) => !deleteRunIds.has(item.id));
-  });
-  await log("info", "Retention cleanup applied", { keepLast, keepDays, deletedRuns: deleteRuns.length, deletedArtifacts: deleteArtifacts.length });
+  await db.deleteArtifactsByRunIds(deleteRunIds);
+  await db.deleteLogsByRunIds(deleteRunIds);
+  for (const runId of deleteRunIds) {
+    // We don't have a bulk delete, so delete runs individually (rare operation)
+    await db.pool.query(`DELETE FROM runs WHERE id = $1`, [runId]);
+  }
+  await log("info", "Retention cleanup applied", { keepLast, keepDays, deletedRuns: deleteRuns.length, deletedArtifacts: toDelete.length });
 }
 
 async function deleteArtifact(destination: Destination, path: string, microsoftCredentials?: any) {
@@ -169,18 +160,15 @@ async function verifyLocalArtifacts(source: Source, files: string[], log: Logger
   }
 }
 
-async function failRun(store: Store, run: BackupRun, code: string, message: string, startedAt = run.startedAt ?? now()) {
+async function failRun(db: AppDb, run: BackupRun, code: string, message: string, startedAt = run.startedAt ?? now()) {
   const finishedAt = now();
-  await store.update((db) => {
-    const target = db.runs.find((item) => item.id === run.id);
-    if (target) {
-      target.status = "failed";
-      target.errorCode = code;
-      target.errorMessage = message;
-      target.startedAt = startedAt;
-      target.finishedAt = finishedAt;
-      target.durationMs = Date.parse(finishedAt) - Date.parse(startedAt);
-    }
+  await db.updateRun(run.id, {
+    status: "failed",
+    errorCode: code,
+    errorMessage: message,
+    startedAt,
+    finishedAt,
+    durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
   });
 }
 
@@ -214,12 +202,8 @@ async function createPostgresDump(source: Source, policy: Policy, runDir: string
   let stderr = "";
   child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString().slice(0, 65536); });
 
-  // Registra o exit code ANTES de aguardar o pipeline — "close" pode disparar
-  // antes do pipeline resolver, então não podemos usar child.on() depois do await.
   const exitCodeP = new Promise<number>((resolve) => child.on("close", (code) => resolve(code ?? 1)));
 
-  // pipeline() gerencia corretamente end/error/cleanup em todos os streams.
-  // Qualquer erro de I/O propaga como exceção e fecha todos os streams envolvidos.
   try {
     const fileStream = createWriteStream(out);
     if (useGzip) {
@@ -228,7 +212,6 @@ async function createPostgresDump(source: Source, policy: Policy, runDir: string
       await pipeline(child.stdout, fileStream);
     }
   } catch (err: any) {
-    // Stream falhou — apaga o arquivo parcial para não confundir verifyLocalArtifacts
     await rm(out, { force: true }).catch(() => {});
     throw new Error(stderr || err.message || `${cmd} stream failed`);
   }
@@ -251,22 +234,19 @@ async function createMinioSnapshot(source: Source, policy: Policy, runDir: strin
     await writeFile(out, `SnapVault development MinIO snapshot\nsource=${source.name}\ncreatedAt=${now()}\n`);
     return [out];
   }
-  const config = source.config as any;
+  const cfg = source.config as any;
   const scope = resolvePolicyScope(source, policy);
   const alias = `snapvault-${source.id}-${Date.now()}`;
   const objectDir = join(runDir, "objects");
   await mkdir(objectDir, { recursive: true });
-  const aliasResult = await runCommand("mc", ["alias", "set", alias, String(config.endpoint), source.secrets.accessKey ?? "", source.secrets.secretKey ?? ""]);
+  const aliasResult = await runCommand("mc", ["alias", "set", alias, String(cfg.endpoint), source.secrets.accessKey ?? "", source.secrets.secretKey ?? ""]);
   if (aliasResult.code !== 0) throw new Error(aliasResult.stderr || "mc alias set failed");
   if (scope.mode !== "all" && !scope.bucket) throw new Error("MinIO backup routine has no bucket selected");
   const bucketPath = scope.mode === "all" ? "" : [String(scope.bucket), String(scope.prefix ?? "").replace(/^\/+|\/+$/g, "")].filter(Boolean).join("/");
-  // mc cp pode gerar stdout enorme (um log por objeto) — descarta stdout, captura apenas stderr
   const copyResult = await spawnIgnoreStdout("mc", ["cp", "--recursive", `${alias}/${bucketPath}`, objectDir]);
   await runCommand("mc", ["alias", "remove", alias]);
   if (copyResult.code !== 0) throw new Error(copyResult.stderr || "mc copy failed");
-  // tar: stdout vazio (escreve direto no arquivo), stderr pequeno
   const tarResult = await spawnIgnoreStdout("tar", ["-czf", out, "-C", objectDir, "."]);
-  // objectDir não é mais necessário após o tar — limpa imediatamente
   await rm(objectDir, { recursive: true, force: true }).catch(() => {});
   if (tarResult.code !== 0) throw new Error(tarResult.stderr || "tar failed");
   await log("info", "MinIO snapshot created", { bucket: scope.mode === "all" ? "all" : scope.bucket, prefix: scope.prefix ?? "" });
@@ -276,9 +256,9 @@ async function createMinioSnapshot(source: Source, policy: Policy, runDir: strin
 function resolvePolicyScope(source: Source, policy: Policy) {
   const scope = policy.sourceScope as any;
   if (scope?.mode) return scope;
-  const config = source.config as any;
-  if (source.type === "postgres") return { mode: config.scope === "all" ? "all" : "single", database: config.database };
-  return { mode: config.scope === "all" ? "all" : "single", bucket: config.bucket, prefix: config.prefix ?? "" };
+  const cfg = source.config as any;
+  if (source.type === "postgres") return { mode: cfg.scope === "all" ? "all" : "single", database: cfg.database };
+  return { mode: cfg.scope === "all" ? "all" : "single", bucket: cfg.bucket, prefix: cfg.prefix ?? "" };
 }
 
 async function writeManifest(run: BackupRun, source: Source, policy: Policy, files: string[], runDir: string) {
@@ -348,10 +328,12 @@ async function uploadArtifacts(destination: Destination, source: Source, run: Ba
   return records;
 }
 
-function getMicrosoftCredentials(db: any, integrationId?: string) {
+async function getMicrosoftCredentials(db: AppDb, integrationId?: string) {
+  const integrations = await db.listMicrosoftIntegrations();
+  const settings = await db.getSettings();
   const saved = integrationId
-    ? db.microsoftIntegrations?.find((item: any) => item.id === integrationId) ?? db.settings?.microsoft
-    : db.settings?.microsoft ?? db.microsoftIntegrations?.[0];
+    ? integrations.find((item: any) => item.id === integrationId) ?? settings.microsoft
+    : settings.microsoft ?? integrations[0];
   if (saved?.tenantId && saved?.clientId && saved?.encryptedClientSecret) {
     return { tenantId: saved.tenantId, clientId: saved.clientId, clientSecret: decryptText(saved.encryptedClientSecret, config.cookieSecret) };
   }

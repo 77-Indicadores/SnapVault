@@ -8,20 +8,21 @@ import { mkdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { config } from "./config.js";
+import { createDb } from "./db.js";
 import { decryptText, encryptText } from "./crypto.js";
 import { id, now } from "./ids.js";
-import { publicMicrosoftConfig, publicUser, Store, withoutSecrets } from "./store.js";
+import { publicUser, withoutSecrets } from "./store.js";
 import { executeBackupRun } from "./backup.js";
 import { getMicrosoftDriveQuota, listMicrosoftSiteDrives, listMicrosoftSites, listMicrosoftUsers, microsoftCredentialStatus, testMicrosoftDestination } from "./microsoftGraph.js";
 import { verifyRestoreForRun } from "./restoreVerify.js";
 import { runCommand } from "./runner.js";
 
-const store = new Store(config.databasePath);
+const db = await createDb(config.pg);
 
 // Token: env var tem prioridade; fallback para o valor salvo no banco
-const dbForLogger = await store.read();
-const betterstackToken = config.betterstackToken || dbForLogger.settings?.betterstack?.token || "";
-const betterstackHost = dbForLogger.settings?.betterstack?.ingestingHost || "";
+const initSettings = await db.getSettings();
+const betterstackToken = config.betterstackToken || initSettings.betterstack?.token || "";
+const betterstackHost = initSettings.betterstack?.ingestingHost || "";
 
 const loggerOptions = betterstackToken
   ? {
@@ -33,7 +34,6 @@ const loggerOptions = betterstackToken
             target: "@logtail/pino",
             options: {
               sourceToken: betterstackToken,
-              // Usa o ingesting host específico da source; fallback para o endpoint global
               ...(betterstackHost ? { options: { endpoint: `https://${betterstackHost}` } } : {})
             },
             level: "info"
@@ -122,6 +122,24 @@ const policyPatchSchema = z.object({
   enabled: z.boolean().optional()
 });
 
+const createUserSchema = z.object({
+  name: z.string().min(1),
+  email: z.string().email(),
+  password: z.string().min(8),
+  role: z.enum(["admin", "operator", "viewer"]).default("viewer")
+});
+
+const updateUserSchema = z.object({
+  name: z.string().min(1).optional(),
+  email: z.string().email().optional(),
+  role: z.enum(["admin", "operator", "viewer"]).optional()
+});
+
+const changePasswordSchema = z.object({
+  currentPassword: z.string().optional(),
+  newPassword: z.string().min(8)
+});
+
 app.setErrorHandler((error, _request, reply) => {
   app.log.error(error);
   const message = error instanceof Error ? error.message : "Request failed";
@@ -132,18 +150,20 @@ app.get("/health", async () => ({ status: "ok" }));
 app.get("/ready", async () => ({ status: "ready" }));
 
 app.get("/api/v1/setup/status", async () => {
-  const db = await store.read();
-  return { requiresSetup: db.users.length === 0 };
+  const count = await db.countUsers();
+  return { requiresSetup: count === 0 };
 });
 
 app.post("/api/v1/setup/admin", async (request, reply) => {
   const body = z.object({ name: z.string().min(1), email: z.string().email(), password: z.string().min(8) }).parse(request.body);
-  const user = await store.update(async (db) => {
-    if (db.users.length > 0) throw new Error("Setup already completed");
-    const created = now();
-    const next = { id: id("user"), name: body.name, email: body.email.toLowerCase(), passwordHash: await bcrypt.hash(body.password, 12), role: "admin" as const, createdAt: created, updatedAt: created };
-    db.users.push(next);
-    return next;
+  const count = await db.countUsers();
+  if (count > 0) throw new Error("Setup already completed");
+  const user = await db.createUser({
+    id: id("user"),
+    name: body.name,
+    email: body.email.toLowerCase(),
+    passwordHash: await bcrypt.hash(body.password, 12),
+    role: "admin"
   });
   await createSession(reply, user.id);
   return { user: publicUser(user) };
@@ -151,8 +171,7 @@ app.post("/api/v1/setup/admin", async (request, reply) => {
 
 app.post("/api/v1/auth/login", async (request, reply) => {
   const body = z.object({ email: z.string().email(), password: z.string() }).parse(request.body);
-  const db = await store.read();
-  const user = db.users.find((item) => item.email === body.email.toLowerCase());
+  const user = await db.getUserByEmail(body.email.toLowerCase());
   if (!user || !(await bcrypt.compare(body.password, user.passwordHash))) {
     return reply.status(401).send({ error: { code: "INVALID_CREDENTIALS", message: "Invalid email or password", details: {} } });
   }
@@ -162,11 +181,7 @@ app.post("/api/v1/auth/login", async (request, reply) => {
 
 app.post("/api/v1/auth/logout", async (request, reply) => {
   const sessionId = request.cookies.snapvault_session;
-  if (sessionId) {
-    await store.update((db) => {
-      db.sessions = db.sessions.filter((item) => item.id !== sessionId);
-    });
-  }
+  if (sessionId) await db.deleteSession(sessionId);
   reply.clearCookie("snapvault_session", { path: "/" });
   return { ok: true };
 });
@@ -177,48 +192,39 @@ app.post("/api/v1/admin/restart", { preHandler: requireAuth }, async (_request, 
   reply.send({ ok: true, message: "Reinicio solicitado..." });
   setImmediate(() => {
     if (process.send) {
-      // Modo cluster: delega o rolling restart ao master
       process.send({ type: "restart" });
     } else {
-      // Modo dev (sem master): shutdown normal
       gracefulShutdown("restart solicitado pelo usuario via painel");
     }
   });
 });
 
 app.get("/api/v1/settings", { preHandler: requireAuth }, async () => {
-  const db = await store.read();
-  return { timezone: db.settings?.timezone ?? "America/Sao_Paulo" };
+  const settings = await db.getSettings();
+  return { timezone: settings.timezone ?? "America/Sao_Paulo" };
 });
 
 app.patch("/api/v1/settings", { preHandler: requireAuth }, async (request) => {
   const body = z.object({ timezone: z.string().min(1) }).parse(request.body);
-  const result = await store.update((db) => {
-    db.settings = db.settings ?? { microsoft: null, timezone: "America/Sao_Paulo" };
-    db.settings.timezone = body.timezone;
-    return { timezone: db.settings.timezone };
-  });
-  return result;
+  await db.setSetting("timezone", body.timezone);
+  return { timezone: body.timezone };
 });
 
 app.get("/api/v1/integrations/betterstack", { preHandler: requireAuth }, async () => {
-  const db = await store.read();
-  const bs = db.settings?.betterstack;
+  const settings = await db.getSettings();
+  const bs = settings.betterstack;
   return { configured: Boolean(bs?.token), ingestingHost: bs?.ingestingHost ?? "", tokenSet: Boolean(bs?.token) };
 });
 
 app.patch("/api/v1/integrations/betterstack", { preHandler: requireAuth }, async (request) => {
   const body = z.object({ token: z.string(), ingestingHost: z.string() }).parse(request.body);
-  await store.update((db) => {
-    db.settings = db.settings ?? { timezone: "America/Sao_Paulo" };
-    db.settings.betterstack = { token: body.token, ingestingHost: body.ingestingHost };
-  });
+  await db.setSetting("betterstack", { token: body.token, ingestingHost: body.ingestingHost });
   return { ok: true };
 });
 
-app.post("/api/v1/integrations/betterstack/test", { preHandler: requireAuth }, async (request) => {
-  const db = await store.read();
-  const bs = db.settings?.betterstack;
+app.post("/api/v1/integrations/betterstack/test", { preHandler: requireAuth }, async () => {
+  const settings = await db.getSettings();
+  const bs = settings.betterstack;
   if (!bs?.token || !bs?.ingestingHost) throw new Error("BetterStack nao configurado");
   const url = `https://${bs.ingestingHost}`;
   const payload = JSON.stringify({ dt: new Date().toISOString(), message: "Hello from SnapVault! Integracao BetterStack funcionando." });
@@ -232,136 +238,129 @@ app.post("/api/v1/integrations/betterstack/test", { preHandler: requireAuth }, a
 });
 
 app.get("/api/v1/integrations/microsoft", { preHandler: requireAuth }, async () => {
-  const db = await store.read();
-  return { integrations: (db.microsoftIntegrations ?? []).map(publicMicrosoftIntegrationSafe) };
+  const integrations = await db.listMicrosoftIntegrations();
+  return { integrations: integrations.map(publicMicrosoftIntegrationSafe) };
 });
 
 app.post("/api/v1/integrations/microsoft", { preHandler: requireAuth }, async (request) => {
   const body = microsoftConfigSchema.parse(request.body);
   if (!body.clientSecret) throw new Error("Client secret is required");
-  const integration = await store.update((db) => {
-    db.microsoftIntegrations = db.microsoftIntegrations ?? [];
-    const stamp = now();
-    const next = {
-      id: id("ms"),
-      name: body.name,
-      tenantId: body.tenantId,
-      clientId: body.clientId,
-      encryptedClientSecret: encryptText(body.clientSecret!, config.cookieSecret),
-      status: "untested" as const,
-      lastTestedAt: null,
-      createdAt: stamp,
-      updatedAt: stamp
-    };
-    db.microsoftIntegrations.push(next);
-    db.settings = db.settings ?? {};
-    db.settings.microsoft = db.settings.microsoft ?? next;
-    return publicMicrosoftIntegrationSafe(next);
-  });
-  return { integration };
+  const stamp = now();
+  const next = {
+    id: id("ms"),
+    name: body.name,
+    tenantId: body.tenantId,
+    clientId: body.clientId,
+    encryptedClientSecret: encryptText(body.clientSecret!, config.cookieSecret),
+    status: "untested" as const,
+    lastTestedAt: null,
+    createdAt: stamp,
+    updatedAt: stamp
+  };
+  const integration = await db.upsertMicrosoftIntegration(next);
+  // Set as default if first
+  const all = await db.listMicrosoftIntegrations();
+  if (all.length === 1) await db.setSetting("microsoft", integration);
+  return { integration: publicMicrosoftIntegrationSafe(integration) };
 });
 
 app.patch("/api/v1/integrations/microsoft/:id", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
   const body = microsoftConfigSchema.partial().parse(request.body);
-  const integration = await store.update((db) => {
-    const target = (db.microsoftIntegrations ?? []).find((item) => item.id === params.id);
-    if (!target) throw new Error("Microsoft integration not found");
-    if (body.name) target.name = body.name;
-    if (body.tenantId) target.tenantId = body.tenantId;
-    if (body.clientId) target.clientId = body.clientId;
-    if (body.clientSecret) target.encryptedClientSecret = encryptText(body.clientSecret, config.cookieSecret);
-    target.status = "untested";
-    target.updatedAt = now();
-    return publicMicrosoftIntegrationSafe(target);
-  });
-  return { integration };
+  const target = await db.getMicrosoftIntegration(params.id);
+  if (!target) throw new Error("Microsoft integration not found");
+  const updated = {
+    ...target,
+    name: body.name ?? target.name,
+    tenantId: body.tenantId ?? target.tenantId,
+    clientId: body.clientId ?? target.clientId,
+    encryptedClientSecret: body.clientSecret ? encryptText(body.clientSecret, config.cookieSecret) : target.encryptedClientSecret,
+    status: "untested" as const,
+    updatedAt: now()
+  };
+  const integration = await db.upsertMicrosoftIntegration(updated);
+  return { integration: publicMicrosoftIntegrationSafe(integration) };
 });
 
 app.post("/api/v1/integrations/microsoft/:id/test", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
   const credentials = await microsoftCredentials(params.id);
   const result = await microsoftCredentialStatus(credentials);
-  const integration = await store.update((db) => {
-    const target = (db.microsoftIntegrations ?? []).find((item) => item.id === params.id);
-    if (!target) throw new Error("Microsoft integration not found");
-    target.status = "healthy";
-    target.lastTestedAt = now();
-    target.updatedAt = now();
-    return publicMicrosoftIntegrationSafe(target);
-  });
-  return { ...result, integration };
+  const target = await db.getMicrosoftIntegration(params.id);
+  if (!target) throw new Error("Microsoft integration not found");
+  const updated = { ...target, status: "healthy" as const, lastTestedAt: now(), updatedAt: now() };
+  const integration = await db.upsertMicrosoftIntegration(updated);
+  return { ...result, integration: publicMicrosoftIntegrationSafe(integration) };
 });
 
 app.delete("/api/v1/integrations/microsoft/:id", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  await store.update((db) => {
-    if (db.destinations.some((item) => item.config?.microsoftIntegrationId === params.id)) throw new Error("Microsoft integration is used by storage");
-    db.microsoftIntegrations = (db.microsoftIntegrations ?? []).filter((item) => item.id !== params.id);
-    if (db.settings?.microsoft?.id === params.id) db.settings.microsoft = db.microsoftIntegrations[0] ?? null;
-  });
+  const destinations = await db.listDestinations();
+  if (destinations.some((item) => item.config?.microsoftIntegrationId === params.id)) throw new Error("Microsoft integration is used by storage");
+  await db.deleteMicrosoftIntegration(params.id);
+  // Update default if needed
+  const settings = await db.getSettings();
+  if ((settings.microsoft as any)?.id === params.id) {
+    const remaining = await db.listMicrosoftIntegrations();
+    await db.setSetting("microsoft", remaining[0] ?? null);
+  }
   return { ok: true };
 });
 
 app.get("/api/v1/integrations/microsoft/config", { preHandler: requireAuth }, async () => {
-  const db = await store.read();
-  const saved = publicMicrosoftConfig(db.settings);
-  if (saved.configured) return saved;
+  const settings = await db.getSettings();
+  const integrations = await db.listMicrosoftIntegrations();
+  const saved = settings.microsoft ?? integrations[0] ?? null;
+  if (saved) return publicMicrosoftIntegrationSafe(saved);
   return {
-    ...saved,
     configured: Boolean(config.microsoft.tenantId && config.microsoft.clientId && config.microsoft.clientSecret),
+    id: "", name: "",
     tenantId: config.microsoft.tenantId,
     clientId: config.microsoft.clientId,
     clientSecretSet: Boolean(config.microsoft.clientSecret),
+    status: "untested",
+    lastTestedAt: null,
     source: config.microsoft.clientSecret ? "env" : "none"
   };
 });
 
 app.put("/api/v1/integrations/microsoft/config", { preHandler: requireAuth }, async (request) => {
   const body = microsoftConfigSchema.parse(request.body);
-  const saved = await store.update((db) => {
-    const previous = db.settings?.microsoft;
-    const clientSecret = body.clientSecret
-      ? body.clientSecret
-      : previous?.encryptedClientSecret
-        ? decryptText(previous.encryptedClientSecret, config.cookieSecret)
-        : config.microsoft.clientSecret;
-    if (!clientSecret) throw new Error("Client secret is required");
-    const stamp = now();
-    db.settings = db.settings ?? {};
-    const next = {
-      id: previous?.id ?? id("ms"),
-      name: body.name ?? previous?.name ?? "Microsoft principal",
-      tenantId: body.tenantId,
-      clientId: body.clientId,
-      encryptedClientSecret: encryptText(clientSecret, config.cookieSecret),
-      status: "untested",
-      lastTestedAt: previous?.lastTestedAt ?? null,
-      createdAt: previous?.createdAt ?? stamp,
-      updatedAt: stamp
-    };
-    db.microsoftIntegrations = db.microsoftIntegrations ?? [];
-    const index = db.microsoftIntegrations.findIndex((item) => item.id === next.id);
-    if (index >= 0) db.microsoftIntegrations[index] = next as any;
-    else db.microsoftIntegrations.push(next as any);
-    db.settings.microsoft = next as any;
-    return publicMicrosoftConfig(db.settings);
-  });
-  return saved;
+  const settings = await db.getSettings();
+  const previous = settings.microsoft;
+  const clientSecret = body.clientSecret
+    ? body.clientSecret
+    : previous?.encryptedClientSecret
+      ? decryptText(previous.encryptedClientSecret, config.cookieSecret)
+      : config.microsoft.clientSecret;
+  if (!clientSecret) throw new Error("Client secret is required");
+  const stamp = now();
+  const next = {
+    id: previous?.id ?? id("ms"),
+    name: body.name ?? previous?.name ?? "Microsoft principal",
+    tenantId: body.tenantId,
+    clientId: body.clientId,
+    encryptedClientSecret: encryptText(clientSecret, config.cookieSecret),
+    status: "untested" as const,
+    lastTestedAt: previous?.lastTestedAt ?? null,
+    createdAt: previous?.createdAt ?? stamp,
+    updatedAt: stamp
+  };
+  const integration = await db.upsertMicrosoftIntegration(next);
+  await db.setSetting("microsoft", integration);
+  return publicMicrosoftIntegrationSafe(integration);
 });
 
 app.post("/api/v1/integrations/microsoft/test", { preHandler: requireAuth }, async () => {
   const credentials = await microsoftCredentials();
   const result = await microsoftCredentialStatus(credentials);
-  const updated = await store.update((db) => {
-    if (db.settings?.microsoft) {
-      db.settings.microsoft.status = "healthy";
-      db.settings.microsoft.lastTestedAt = now();
-      db.settings.microsoft.updatedAt = now();
-    }
-    return publicMicrosoftConfig(db.settings);
-  });
-  return { ...result, config: updated };
+  const settings = await db.getSettings();
+  if (settings.microsoft) {
+    const updated = { ...settings.microsoft, status: "healthy" as const, lastTestedAt: now(), updatedAt: now() };
+    await db.upsertMicrosoftIntegration(updated);
+    await db.setSetting("microsoft", updated);
+  }
+  return { ...result };
 });
 
 app.get("/api/v1/integrations/microsoft/status", { preHandler: requireAuth }, async () => microsoftCredentialStatus(await microsoftCredentials()));
@@ -382,25 +381,96 @@ app.get("/api/v1/integrations/microsoft/drive-quota", { preHandler: requireAuth 
   return getMicrosoftDriveQuota(query.driveId, await microsoftCredentials(query.integrationId));
 });
 
+// ── Users management ──────────────────────────────────────────────────────────
+
+app.get("/api/v1/users", { preHandler: requireAuth }, async (request) => {
+  const reqUser = (request as any).user;
+  if (reqUser.role !== "admin") return { users: [publicUser(reqUser)] };
+  const users = await db.listUsers();
+  return { users: users.map(publicUser) };
+});
+
+app.post("/api/v1/users", { preHandler: requireAuth }, async (request) => {
+  const reqUser = (request as any).user;
+  if (reqUser.role !== "admin") throw new Error("Admin required");
+  const body = createUserSchema.parse(request.body);
+  const existing = await db.getUserByEmail(body.email.toLowerCase());
+  if (existing) throw new Error("Email already in use");
+  const user = await db.createUser({
+    id: id("user"),
+    name: body.name,
+    email: body.email.toLowerCase(),
+    passwordHash: await bcrypt.hash(body.password, 12),
+    role: body.role
+  });
+  return { user: publicUser(user) };
+});
+
+app.patch("/api/v1/users/:id", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const reqUser = (request as any).user;
+  const isAdmin = reqUser.role === "admin";
+  const isSelf = reqUser.id === params.id;
+  if (!isAdmin && !isSelf) throw new Error("Forbidden");
+  const body = updateUserSchema.parse(request.body);
+  const updateData: any = {};
+  if (body.name !== undefined) updateData.name = body.name;
+  if (body.email !== undefined && isAdmin) updateData.email = body.email.toLowerCase();
+  if (body.role !== undefined && isAdmin) updateData.role = body.role;
+  const user = await db.updateUser(params.id, updateData);
+  return { user: publicUser(user) };
+});
+
+app.delete("/api/v1/users/:id", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const reqUser = (request as any).user;
+  if (reqUser.role !== "admin") throw new Error("Admin required");
+  if (reqUser.id === params.id) throw new Error("Cannot delete your own account");
+  // Prevent removing last admin
+  const target = await db.getUser(params.id);
+  if (target?.role === "admin") {
+    const allUsers = await db.listUsers();
+    const adminCount = allUsers.filter((u) => u.role === "admin").length;
+    if (adminCount <= 1) throw new Error("Cannot remove the last admin");
+  }
+  await db.deleteUser(params.id);
+  return { ok: true };
+});
+
+app.post("/api/v1/users/:id/password", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const reqUser = (request as any).user;
+  const isAdmin = reqUser.role === "admin";
+  const isSelf = reqUser.id === params.id;
+  if (!isAdmin && !isSelf) throw new Error("Forbidden");
+  const body = changePasswordSchema.parse(request.body);
+  if (!isAdmin) {
+    if (!body.currentPassword) throw new Error("Current password is required");
+    const user = await db.getUser(params.id);
+    if (!user || !(await bcrypt.compare(body.currentPassword, user.passwordHash))) throw new Error("Current password is incorrect");
+  }
+  const passwordHash = await bcrypt.hash(body.newPassword, 12);
+  await db.updateUser(params.id, { passwordHash });
+  return { ok: true };
+});
+
+// ── Sources ───────────────────────────────────────────────────────────────────
+
 app.get("/api/v1/sources", { preHandler: requireAuth }, async () => {
-  const db = await store.read();
-  return { sources: db.sources.map(withoutSecrets) };
+  const sources = await db.listSources();
+  return { sources: sources.map(withoutSecrets) };
 });
 
 app.post("/api/v1/sources", { preHandler: requireAuth }, async (request) => {
   const body = sourceSchema.parse(request.body);
   const created = now();
-  const source = { id: id("src"), ...body, status: "untested" as const, lastTestedAt: null, createdAt: created, updatedAt: created };
-  await store.update((db) => {
-    db.sources.push(source);
-  });
+  const source = await db.createSource({ id: id("src"), ...body, status: "untested", lastTestedAt: null, createdAt: created, updatedAt: created });
   return { source: withoutSecrets(source) };
 });
 
 app.post("/api/v1/sources/:id/test", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  const db = await store.read();
-  const source = db.sources.find((item) => item.id === params.id);
+  const source = await db.getSource(params.id);
   if (!source) throw new Error("Source not found");
   const result = source.type === "postgres" ? await testPostgresSource(source as any) : await testMinioSource(source as any);
   await markResource("source", params.id, result);
@@ -409,8 +479,7 @@ app.post("/api/v1/sources/:id/test", { preHandler: requireAuth }, async (request
 
 app.get("/api/v1/sources/:id/resources", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  const db = await store.read();
-  const source = db.sources.find((item) => item.id === params.id);
+  const source = await db.getSource(params.id);
   if (!source) throw new Error("Source not found");
   if (source.type === "postgres") return testPostgresSource(source as any);
   return testMinioSource(source as any);
@@ -419,73 +488,58 @@ app.get("/api/v1/sources/:id/resources", { preHandler: requireAuth }, async (req
 app.patch("/api/v1/sources/:id", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
   const body = sourcePatchSchema.parse(request.body);
-  const source = await store.update((db) => {
-    const target = db.sources.find((item) => item.id === params.id);
-    if (!target) throw new Error("Source not found");
-    Object.assign(target, body, { updatedAt: now() });
-    if (body.secrets) target.status = "untested";
-    return withoutSecrets(target);
-  });
-  return { source };
+  const current = await db.getSource(params.id);
+  if (!current) throw new Error("Source not found");
+  const updateData: any = { ...body, updatedAt: now() };
+  if (body.secrets) updateData.status = "untested";
+  const source = await db.updateSource(params.id, updateData);
+  return { source: withoutSecrets(source) };
 });
 
 app.delete("/api/v1/sources/:id", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  await store.update((db) => {
-    if (db.policies.some((item) => item.sourceId === params.id)) throw new Error("Source is used by a backup routine");
-    if (db.runs.some((item) => item.sourceId === params.id) || db.artifacts.some((item) => item.sourceId === params.id)) throw new Error("Source has backup history; archive it instead");
-    db.sources = db.sources.filter((item) => item.id !== params.id);
-  });
+  const policies = await db.listPolicies();
+  if (policies.some((item) => item.sourceId === params.id)) throw new Error("Source is used by a backup routine");
+  const runs = await db.listRuns();
+  const artifacts = await db.listArtifacts();
+  if (runs.some((item) => item.sourceId === params.id) || artifacts.some((item) => item.sourceId === params.id)) throw new Error("Source has backup history; archive it instead");
+  await db.deleteSource(params.id);
   return { ok: true };
 });
 
 app.post("/api/v1/sources/:id/archive", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  const source = await store.update((db) => {
-    const target = db.sources.find((item) => item.id === params.id);
-    if (!target) throw new Error("Source not found");
-    target.status = "archived";
-    target.updatedAt = now();
-    for (const policy of db.policies.filter((item) => item.sourceId === params.id)) {
-      policy.enabled = false;
-      policy.updatedAt = now();
-    }
-    return withoutSecrets(target);
-  });
-  return { source };
+  const source = await db.updateSource(params.id, { status: "archived", updatedAt: now() });
+  const policies = await db.listPolicies();
+  for (const policy of policies.filter((item) => item.sourceId === params.id)) {
+    await db.updatePolicy(policy.id, { enabled: false, updatedAt: now() });
+  }
+  return { source: withoutSecrets(source) };
 });
 
 app.post("/api/v1/sources/:id/reactivate", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  const source = await store.update((db) => {
-    const target = db.sources.find((item) => item.id === params.id);
-    if (!target) throw new Error("Source not found");
-    target.status = "untested";
-    target.updatedAt = now();
-    return withoutSecrets(target);
-  });
-  return { source };
+  const source = await db.updateSource(params.id, { status: "untested", updatedAt: now() });
+  return { source: withoutSecrets(source) };
 });
 
+// ── Destinations ──────────────────────────────────────────────────────────────
+
 app.get("/api/v1/destinations", { preHandler: requireAuth }, async () => {
-  const db = await store.read();
-  return { destinations: db.destinations.map(withoutSecrets) };
+  const destinations = await db.listDestinations();
+  return { destinations: destinations.map(withoutSecrets) };
 });
 
 app.post("/api/v1/destinations", { preHandler: requireAuth }, async (request) => {
   const body = destinationSchema.parse(request.body);
   const created = now();
-  const destination = { id: id("dst"), ...body, status: "untested" as const, lastTestedAt: null, createdAt: created, updatedAt: created };
-  await store.update((db) => {
-    db.destinations.push(destination);
-  });
+  const destination = await db.createDestination({ id: id("dst"), ...body, status: "untested", lastTestedAt: null, metadata: body.metadata ?? {}, archivedAt: null, createdAt: created, updatedAt: created });
   return { destination: withoutSecrets(destination) };
 });
 
 app.post("/api/v1/destinations/:id/test", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  const db = await store.read();
-  const destination = db.destinations.find((item) => item.id === params.id);
+  const destination = await db.getDestination(params.id);
   if (!destination) throw new Error("destination not found");
   if (destination.status === "archived") throw new Error("Archived storage cannot be tested until it is reactivated");
   if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
@@ -499,152 +553,140 @@ app.post("/api/v1/destinations/:id/test", { preHandler: requireAuth }, async (re
 app.patch("/api/v1/destinations/:id", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
   const body = destinationPatchSchema.parse(request.body);
-  const destination = await store.update((db) => {
-    const target = db.destinations.find((item) => item.id === params.id);
-    if (!target) throw new Error("Destination not found");
-    Object.assign(target, body, { updatedAt: now() });
-    return withoutSecrets(target);
-  });
-  return { destination };
+  const destination = await db.updateDestination(params.id, { ...body, updatedAt: now() });
+  return { destination: withoutSecrets(destination) };
 });
 
 app.delete("/api/v1/destinations/:id", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  await store.update((db) => {
-    if (db.policies.some((item) => item.destinationId === params.id)) throw new Error("Destination is used by a backup routine");
-    if (db.runs.some((item) => item.destinationId === params.id) || db.artifacts.some((item) => item.destinationId === params.id)) throw new Error("Destination has backup history; archive it instead");
-    db.destinations = db.destinations.filter((item) => item.id !== params.id);
-  });
+  const policies = await db.listPolicies();
+  if (policies.some((item) => item.destinationId === params.id)) throw new Error("Destination is used by a backup routine");
+  const runs = await db.listRuns();
+  const artifacts = await db.listArtifacts();
+  if (runs.some((item) => item.destinationId === params.id) || artifacts.some((item) => item.destinationId === params.id)) throw new Error("Destination has backup history; archive it instead");
+  await db.deleteDestination(params.id);
   return { ok: true };
 });
 
 app.post("/api/v1/destinations/:id/archive", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  const destination = await store.update((db) => {
-    const target = db.destinations.find((item) => item.id === params.id);
-    if (!target) throw new Error("Destination not found");
-    target.status = "archived";
-    target.archivedAt = now();
-    target.updatedAt = now();
-    for (const policy of db.policies.filter((item) => item.destinationId === params.id)) {
-      policy.enabled = false;
-      policy.updatedAt = now();
-    }
-    return withoutSecrets(target);
-  });
-  return { destination };
+  const destination = await db.updateDestination(params.id, { status: "archived", archivedAt: now(), updatedAt: now() });
+  const policies = await db.listPolicies();
+  for (const policy of policies.filter((item) => item.destinationId === params.id)) {
+    await db.updatePolicy(policy.id, { enabled: false, updatedAt: now() });
+  }
+  return { destination: withoutSecrets(destination) };
 });
 
 app.post("/api/v1/destinations/:id/reactivate", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  const destination = await store.update((db) => {
-    const target = db.destinations.find((item) => item.id === params.id);
-    if (!target) throw new Error("Destination not found");
-    target.status = "untested";
-    target.archivedAt = null;
-    target.updatedAt = now();
-    return withoutSecrets(target);
-  });
-  return { destination };
+  const destination = await db.updateDestination(params.id, { status: "untested", archivedAt: null, updatedAt: now() });
+  return { destination: withoutSecrets(destination) };
 });
 
+// ── Policies ──────────────────────────────────────────────────────────────────
+
 app.get("/api/v1/policies", { preHandler: requireAuth }, async () => {
-  const db = await store.read();
-  return { policies: db.policies };
+  const policies = await db.listPolicies();
+  return { policies };
 });
 
 app.post("/api/v1/policies", { preHandler: requireAuth }, async (request) => {
   const body = policySchema.parse(request.body);
+  const source = await db.getSource(body.sourceId);
+  if (!source) throw new Error("Source not found");
+  if (source.status !== "healthy") throw new Error("Source must be tested and healthy before creating a backup routine");
+  const destination = await db.getDestination(body.destinationId);
+  if (!destination) throw new Error("Destination not found");
+  if (destination.status !== "healthy") throw new Error("Destination must be tested and healthy before creating a backup routine");
+  assertDestinationReady(destination);
+  validatePolicyScope(source, body.sourceScope);
   const created = now();
-  const policy = { id: id("pol"), ...body, createdAt: created, updatedAt: created };
-  await store.update((db) => {
-    const source = db.sources.find((item) => item.id === body.sourceId);
-    if (!source) throw new Error("Source not found");
-    if (source.status !== "healthy") throw new Error("Source must be tested and healthy before creating a backup routine");
-    const destination = db.destinations.find((item) => item.id === body.destinationId);
-    if (!destination) throw new Error("Destination not found");
-    if (destination.status !== "healthy") throw new Error("Destination must be tested and healthy before creating a backup routine");
-    assertDestinationReady(destination);
-    validatePolicyScope(source, body.sourceScope);
-    db.policies.push(policy);
-  });
+  const policy = await db.createPolicy({ id: id("pol"), ...body, createdAt: created, updatedAt: created });
   return { policy };
 });
 
 app.patch("/api/v1/policies/:id", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
   const body = policyPatchSchema.parse(request.body);
-  const policy = await store.update((db) => {
-    const target = db.policies.find((item) => item.id === params.id);
-    if (!target) throw new Error("Policy not found");
-    if (body.sourceId) {
-      const source = db.sources.find((item) => item.id === body.sourceId);
-      if (!source || source.status !== "healthy") throw new Error("Source must be healthy");
-    }
-    if (body.destinationId) {
-      const destination = db.destinations.find((item) => item.id === body.destinationId);
-      if (!destination || destination.status !== "healthy") throw new Error("Destination must be healthy");
-      assertDestinationReady(destination);
-    }
-    const source = db.sources.find((item) => item.id === (body.sourceId ?? target.sourceId));
-    if (source && body.sourceScope) validatePolicyScope(source, body.sourceScope);
-    Object.assign(target, body, { updatedAt: now() });
-    return target;
-  });
+  const target = await db.getPolicy(params.id);
+  if (!target) throw new Error("Policy not found");
+  if (body.sourceId) {
+    const source = await db.getSource(body.sourceId);
+    if (!source || source.status !== "healthy") throw new Error("Source must be healthy");
+  }
+  if (body.destinationId) {
+    const destination = await db.getDestination(body.destinationId);
+    if (!destination || destination.status !== "healthy") throw new Error("Destination must be healthy");
+    assertDestinationReady(destination);
+  }
+  const source = await db.getSource(body.sourceId ?? target.sourceId);
+  if (source && body.sourceScope) validatePolicyScope(source, body.sourceScope);
+  const policy = await db.updatePolicy(params.id, { ...body, updatedAt: now() });
   return { policy };
 });
 
 app.delete("/api/v1/policies/:id", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  await store.update((db) => {
-    db.policies = db.policies.filter((item) => item.id !== params.id);
-  });
+  await db.deletePolicy(params.id);
   return { ok: true };
 });
 
 app.post("/api/v1/policies/:id/run", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  const run = await store.update((db) => {
-    const policy = db.policies.find((item) => item.id === params.id);
-    if (!policy) throw new Error("Policy not found");
-    const source = db.sources.find((item) => item.id === policy.sourceId);
-    if (!source) throw new Error("Source not found");
-    if (source.status !== "healthy") throw new Error("Source must be healthy before running a backup");
-    const destination = db.destinations.find((item) => item.id === policy.destinationId);
-    if (!destination) throw new Error("Destination not found");
-    if (destination.status !== "healthy") throw new Error("Destination must be healthy before running a backup");
-    assertDestinationReady(destination);
-    const created: any = { id: id("run"), policyId: policy.id, sourceId: policy.sourceId, destinationId: policy.destinationId, trigger: "manual", status: "queued", startedAt: null, finishedAt: null, durationMs: null, bytesWritten: null, errorCode: null, errorMessage: null, verificationStatus: "not_checked", verifiedAt: null, createdAt: now() };
-    db.runs.push(created);
-    return created;
+  const policy = await db.getPolicy(params.id);
+  if (!policy) throw new Error("Policy not found");
+  const source = await db.getSource(policy.sourceId);
+  if (!source) throw new Error("Source not found");
+  if (source.status !== "healthy") throw new Error("Source must be healthy before running a backup");
+  const destination = await db.getDestination(policy.destinationId);
+  if (!destination) throw new Error("Destination not found");
+  if (destination.status !== "healthy") throw new Error("Destination must be healthy before running a backup");
+  assertDestinationReady(destination);
+  const run = await db.createRun({
+    id: id("run"),
+    policyId: policy.id,
+    sourceId: policy.sourceId,
+    destinationId: policy.destinationId,
+    trigger: "manual",
+    status: "queued",
+    startedAt: null,
+    finishedAt: null,
+    durationMs: null,
+    bytesWritten: null,
+    errorCode: null,
+    errorMessage: null,
+    verificationStatus: "not_checked",
+    verifiedAt: null,
+    createdAt: now()
   });
-  void executeBackupRun(store, run.id, config.stagingDir);
+  void executeBackupRun(db, run.id, config.stagingDir);
   return { runId: run.id, status: run.status };
 });
 
 app.get("/api/v1/runs", { preHandler: requireAuth }, async () => {
-  const db = await store.read();
-  return { runs: [...db.runs].sort((a, b) => b.createdAt.localeCompare(a.createdAt)) };
+  const runs = await db.listRuns();
+  return { runs };
 });
 
 app.get("/api/v1/runs/:id", { preHandler: requireAuth }, async (request, reply) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  const db = await store.read();
   const LOG_LIMIT = 500;
-  const allLogs = db.logs.filter((item) => item.runId === params.id);
+  const run = await db.getRun(params.id);
+  const allLogs = await db.getLogs(params.id);
   const truncated = allLogs.length > LOG_LIMIT;
   if (truncated) reply.header("X-Log-Truncated", String(allLogs.length));
+  const artifacts = await db.listArtifacts(params.id);
   return {
-    run: db.runs.find((item) => item.id === params.id),
+    run,
     logs: truncated ? allLogs.slice(-LOG_LIMIT) : allLogs,
-    artifacts: db.artifacts.filter((item) => item.runId === params.id)
+    artifacts
   };
 });
 
 app.get("/api/v1/artifacts/:id/download", { preHandler: requireAuth }, async (request, reply) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  const db = await store.read();
-  const artifact = db.artifacts.find((item) => item.id === params.id);
+  const artifact = await db.getArtifact(params.id);
   if (!artifact) { reply.status(404); return { error: "Artifact not found" }; }
   const filename = artifact.path.split(/[\\/]/).pop() ?? "artifact";
   reply.header("Content-Disposition", `attachment; filename="${filename}"`);
@@ -654,7 +696,7 @@ app.get("/api/v1/artifacts/:id/download", { preHandler: requireAuth }, async (re
     await stat(artifact.path);
     return reply.send(createReadStream(artifact.path));
   }
-  const destination = db.destinations.find((item) => item.id === artifact.destinationId);
+  const destination = await db.getDestination(artifact.destinationId);
   if (!destination) { reply.status(404); return { error: "Destination not found" }; }
   if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
     const { downloadMicrosoftDrivePath } = await import("./microsoftGraph.js");
@@ -684,16 +726,15 @@ app.get("/api/v1/artifacts/:id/download", { preHandler: requireAuth }, async (re
 
 app.post("/api/v1/runs/:id/test-restore", { preHandler: requireAuth }, async (request) => {
   const params = z.object({ id: z.string() }).parse(request.params);
-  return verifyRestoreForRun(store, params.id, config.stagingDir);
+  return verifyRestoreForRun(db, params.id, config.stagingDir);
 });
 
 app.post("/api/v1/restores/prepare", { preHandler: requireAuth }, async (request) => {
   const body = z.object({ artifactId: z.string() }).parse(request.body);
-  const db = await store.read();
-  const artifact = db.artifacts.find((item) => item.id === body.artifactId);
+  const artifact = await db.getArtifact(body.artifactId);
   if (!artifact) throw new Error("Artifact not found");
-  const run = db.runs.find((item) => item.id === artifact.runId);
-  const source = run ? db.sources.find((item) => item.id === run.sourceId) : null;
+  const run = await db.getRun(artifact.runId);
+  const source = run ? await db.getSource(run.sourceId) : null;
   const command = source?.type === "postgres"
     ? "baixe o arquivo, descompacte se necessario e restaure com pg_restore/psql conforme o formato gerado"
     : "baixe o pacote, extraia o conteudo e envie os arquivos para o bucket MinIO desejado";
@@ -719,14 +760,13 @@ app.post("/api/v1/restores/execute", { preHandler: requireAuth }, async (request
       prefix: z.string().optional()
     }).optional()
   }).parse(request.body);
-  const db = await store.read();
-  const artifact = db.artifacts.find((item) => item.id === body.artifactId);
-  const target = db.sources.find((item) => item.id === body.targetSourceId);
+  const artifact = await db.getArtifact(body.artifactId);
+  const target = await db.getSource(body.targetSourceId);
   if (!artifact) throw new Error("Artifact not found");
   if (!target) throw new Error("Target source not found");
   if (target.status !== "healthy") throw new Error("Target source must be healthy");
-  const run = db.runs.find((item) => item.id === artifact.runId);
-  const destination = run ? db.destinations.find((item) => item.id === run.destinationId) : null;
+  const run = await db.getRun(artifact.runId);
+  const destination = run ? await db.getDestination(run.destinationId) : null;
   if (!destination) throw new Error("Artifact destination not found");
   const restoreDir = join(config.stagingDir, "manual-restores", id("rst"));
   await mkdir(restoreDir, { recursive: true });
@@ -746,6 +786,8 @@ app.post("/api/v1/restores/execute", { preHandler: requireAuth }, async (request
     await rm(restoreDir, { recursive: true, force: true });
   }
 });
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function validatePolicyScope(source: any, scope: any) {
   const resolved = resolveSourceScope(source, scope);
@@ -769,35 +811,27 @@ function assertDestinationReady(destination: any) {
 }
 
 async function createSession(reply: any, userId: string) {
-  const session = { id: id("sess"), userId, createdAt: now(), expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 14).toISOString() };
-  await store.update((db) => {
-    db.sessions.push(session);
-  });
+  const session = await db.createSession({ id: id("sess"), userId, expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 14).toISOString() });
   reply.setCookie("snapvault_session", session.id, { path: "/", httpOnly: true, sameSite: "lax" });
 }
 
 async function requireAuth(request: any, reply: any) {
   const sessionId = request.cookies.snapvault_session;
   if (!sessionId) return reply.status(401).send({ error: { code: "UNAUTHENTICATED", message: "Login required", details: {} } });
-  const db = await store.read();
-  const session = db.sessions.find((item) => item.id === sessionId && Date.parse(item.expiresAt) > Date.now());
-  const user = session ? db.users.find((item) => item.id === session.userId) : null;
+  const session = await db.getSession(sessionId);
+  if (!session || Date.parse(session.expiresAt) <= Date.now()) {
+    return reply.status(401).send({ error: { code: "UNAUTHENTICATED", message: "Login required", details: {} } });
+  }
+  const user = await db.getUser(session.userId);
   if (!user) return reply.status(401).send({ error: { code: "UNAUTHENTICATED", message: "Login required", details: {} } });
   request.user = user;
 }
 
 async function markResource(kind: "source" | "destination", resourceId: string, metadata?: Record<string, unknown>) {
-  const updated = await store.update((db) => {
-    const collection = kind === "source" ? db.sources : db.destinations;
-    const target = collection.find((item) => item.id === resourceId);
-    if (!target) throw new Error(`${kind} not found`);
-    target.status = "healthy";
-    target.lastTestedAt = now();
-    target.updatedAt = now();
-    if (metadata && kind === "destination") (target as any).metadata = { ...((target as any).metadata ?? {}), ...metadata };
-    return withoutSecrets(target);
-  });
-  return { status: "healthy", resource: updated };
+  const updated = kind === "source"
+    ? await db.updateSource(resourceId, { status: "healthy", lastTestedAt: now(), updatedAt: now() })
+    : await db.updateDestination(resourceId, { status: "healthy", lastTestedAt: now(), updatedAt: now(), ...(metadata ? { metadata: { ...(await db.getDestination(resourceId))?.metadata, ...metadata } } : {}) });
+  return { status: "healthy", resource: withoutSecrets(updated) };
 }
 
 function publicMicrosoftIntegrationSafe(integration: any) {
@@ -877,10 +911,11 @@ async function restoreMinioArtifact(source: any, localFile: string, restoreDir: 
 }
 
 async function microsoftCredentials(integrationId?: string) {
-  const db = await store.read();
+  const integrations = await db.listMicrosoftIntegrations();
+  const settings = await db.getSettings();
   const saved = integrationId
-    ? (db.microsoftIntegrations ?? []).find((item) => item.id === integrationId) ?? db.settings?.microsoft
-    : db.settings?.microsoft ?? (db.microsoftIntegrations ?? [])[0];
+    ? integrations.find((item) => item.id === integrationId) ?? settings.microsoft
+    : settings.microsoft ?? integrations[0];
   if (saved?.tenantId && saved?.clientId && saved?.encryptedClientSecret) {
     return { tenantId: saved.tenantId, clientId: saved.clientId, clientSecret: decryptText(saved.encryptedClientSecret, config.cookieSecret) };
   }
@@ -905,10 +940,13 @@ function timeInZone(date: Date, timezone: string): { hhmm: string; weekday: numb
 function startScheduler() {
   setInterval(async () => {
     try {
-      const db = await store.read();
-      const systemTimezone = db.settings?.timezone ?? "America/Sao_Paulo";
+      const settings = await db.getSettings();
+      const systemTimezone = settings.timezone ?? "America/Sao_Paulo";
+      const policies = await db.listPolicies();
+      const sources = await db.listSources();
+      const destinations = await db.listDestinations();
       const current = new Date();
-      for (const policy of db.policies) {
+      for (const policy of policies) {
         if (!policy.enabled || policy.schedule.type === "manual" || policy.schedule.type === "cron") continue;
         const tz = policy.schedule.timezone || systemTimezone;
         const { hhmm, weekday } = timeInZone(current, tz);
@@ -918,8 +956,8 @@ function startScheduler() {
         const key = `${policy.id}:${hhmm}:${current.toISOString().slice(0, 10)}`;
         if (scheduledKeys.has(key)) continue;
         scheduledKeys.add(key);
-        const source = db.sources.find((item) => item.id === policy.sourceId);
-        const destination = db.destinations.find((item) => item.id === policy.destinationId);
+        const source = sources.find((item) => item.id === policy.sourceId);
+        const destination = destinations.find((item) => item.id === policy.destinationId);
         if (source?.status !== "healthy" || destination?.status !== "healthy") continue;
         try {
           assertDestinationReady(destination);
@@ -927,12 +965,24 @@ function startScheduler() {
           app.log.warn({ policyId: policy.id, error }, "Scheduled backup skipped because destination is incomplete");
           continue;
         }
-        const run = await store.update((next) => {
-          const created: any = { id: id("run"), policyId: policy.id, sourceId: policy.sourceId, destinationId: policy.destinationId, trigger: "scheduled", status: "queued", startedAt: null, finishedAt: null, durationMs: null, bytesWritten: null, errorCode: null, errorMessage: null, verificationStatus: "not_checked", verifiedAt: null, createdAt: now() };
-          next.runs.push(created);
-          return created;
+        const run = await db.createRun({
+          id: id("run"),
+          policyId: policy.id,
+          sourceId: policy.sourceId,
+          destinationId: policy.destinationId,
+          trigger: "scheduled",
+          status: "queued",
+          startedAt: null,
+          finishedAt: null,
+          durationMs: null,
+          bytesWritten: null,
+          errorCode: null,
+          errorMessage: null,
+          verificationStatus: "not_checked",
+          verifiedAt: null,
+          createdAt: now()
         });
-        void executeBackupRun(store, run.id, config.stagingDir);
+        void executeBackupRun(db, run.id, config.stagingDir);
       }
       if (scheduledKeys.size > 5000) scheduledKeys.clear();
     } catch (error) {
@@ -949,6 +999,7 @@ async function gracefulShutdown(reason: string) {
   }, 5000);
   try {
     await app.close();
+    await db.pool.end();
     clearTimeout(timeout);
     app.log.warn("servidor encerrado com sucesso");
     process.exit(0);
@@ -973,19 +1024,10 @@ process.on("unhandledRejection", (reason) => {
 });
 
 // Ao iniciar, marcar como failed qualquer run preso em queued/running
-// (causado por crash do processo enquanto o backup estava em andamento)
-const stuckCount = await store.update((db) => {
-  const stuck = db.runs.filter((r) => r.status === "queued" || r.status === "running");
-  for (const run of stuck) {
-    run.status = "failed";
-    run.finishedAt = now();
-    run.errorCode = "PROCESS_CRASH";
-    run.errorMessage = "Execucao interrompida por reinicio inesperado do processo";
-  }
-  return stuck.length;
-});
-if (stuckCount > 0) {
-  app.log.warn({ stuckCount }, `boot: ${stuckCount} run(s) preso(s) marcado(s) como failed`);
+const stuck = await db.getStuckRuns();
+if (stuck.length > 0) {
+  await db.markRunsFailed(stuck.map((r) => r.id), "PROCESS_CRASH", "Execucao interrompida por reinicio inesperado do processo");
+  app.log.warn({ stuckCount: stuck.length }, `boot: ${stuck.length} run(s) preso(s) marcado(s) como failed`);
 }
 
 await app.listen({ host: config.host, port: config.port });
