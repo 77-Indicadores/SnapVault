@@ -25,13 +25,46 @@ export class Store {
   constructor(private readonly filePath: string) {}
 
   async read(): Promise<Database> {
+    let raw: string;
     try {
-      const raw = await readFile(this.filePath, "utf8");
-      return migrateDatabase({ ...emptyDb(), ...JSON.parse(raw) });
+      raw = await readFile(this.filePath, "utf8");
     } catch (error: any) {
       if (error?.code === "ENOENT") return emptyDb();
       throw error;
     }
+    try {
+      return migrateDatabase({ ...emptyDb(), ...JSON.parse(raw) });
+    } catch (error: any) {
+      if (!(error instanceof SyntaxError)) throw error;
+      return this._repair(raw);
+    }
+  }
+
+  /**
+   * Recupera um snapvault.json corrompido por uma escrita concorrente anterior.
+   *
+   * Como o arquivo é gerado com JSON.stringify(db, null, 2), o } raiz
+   * sempre fica sozinho na última linha (coluna 0). O lixo de uma escrita
+   * interrompida aparece depois desse }. Encontramos o último \n} para
+   * localizar o fim real do JSON e truncamos o resto.
+   *
+   * Se nem assim for possível parsear, reseta para banco vazio — melhor
+   * que ficar em loop infinito de crash.
+   */
+  private async _repair(raw: string): Promise<Database> {
+    const cutoff = raw.lastIndexOf("\n}");
+    if (cutoff >= 0) {
+      try {
+        const db = migrateDatabase({ ...emptyDb(), ...JSON.parse(raw.slice(0, cutoff + 2)) });
+        await this.write(db); // persiste a versão reparada imediatamente
+        console.warn("[store] snapvault.json estava corrompido — reparado automaticamente no boot");
+        return db;
+      } catch {}
+    }
+    console.error("[store] snapvault.json irrecuperavel — resetando para estado vazio");
+    const db = emptyDb();
+    await this.write(db);
+    return db;
   }
 
   async write(db: Database): Promise<void> {
