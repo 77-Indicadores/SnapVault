@@ -17,6 +17,11 @@ const emptyDb = (): Database => ({
 });
 
 export class Store {
+  // Mutex: serializa todas as escritas para evitar race condition no .tmp → rename.
+  // Sem isso, dois update() concorrentes (ex: logging durante backup) escrevem no
+  // mesmo .tmp e o segundo rename falha com ENOENT porque o primeiro já moveu o arquivo.
+  private _writeLock: Promise<void> = Promise.resolve();
+
   constructor(private readonly filePath: string) {}
 
   async read(): Promise<Database> {
@@ -37,10 +42,16 @@ export class Store {
   }
 
   async update<T>(fn: (db: Database) => T | Promise<T>): Promise<T> {
-    const db = await this.read();
-    const result = await fn(db);
-    await this.write(db);
-    return result;
+    // Encadeia na fila — cada update aguarda o anterior antes de ler+escrever
+    const task = this._writeLock.then(async () => {
+      const db = await this.read();
+      const result = await fn(db);
+      await this.write(db);
+      return result;
+    });
+    // Atualiza o lock ignorando erros para não bloquear a fila se uma operação falhar
+    this._writeLock = task.then(() => {}, () => {});
+    return task;
   }
 }
 
