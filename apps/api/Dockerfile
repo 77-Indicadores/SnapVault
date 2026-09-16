@@ -11,7 +11,8 @@ RUN apt-get update \
   && unzip /tmp/rclone.zip -d /tmp \
   && cp /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone \
   && chmod +x /usr/local/bin/rclone \
-  && curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc \
+  # dl.min.io retorna 410 (projeto mc arquivado pela MinIO); ultimo binario publicado segue no GitHub Releases
+  && curl -fsSL https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z -o /usr/local/bin/mc \
   && chmod +x /usr/local/bin/mc \
   && rm -rf /var/lib/apt/lists/* /tmp/rclone*
 
