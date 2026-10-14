@@ -41,7 +41,11 @@ services:
       - pg-data:/var/lib/postgresql/data
 
   minio:
-    image: quay.io/minio/minio:latest
+    # A MinIO parou de publicar a edicao community no Docker Hub e no quay.io em 2025/2026
+    # (ambos retornam "unauthorized" para qualquer tag). cgr.dev/chainguard/minio e o
+    # substituto gratuito e publico recomendado pela propria comunidade.
+    image: cgr.dev/chainguard/minio:latest
+    user: "0"
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
