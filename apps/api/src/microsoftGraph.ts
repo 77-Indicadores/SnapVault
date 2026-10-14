@@ -102,6 +102,30 @@ export async function deleteMicrosoftDrivePath(destinationConfig: MicrosoftDesti
   return { deleted: true, missing: false, path: cleanPath };
 }
 
+/**
+ * Apaga uma pasta so se ela estiver vazia no momento da checagem (evita apagar algo que
+ * nao rastreamos). Usado para limpar a pasta de um run depois que todos os artifacts dele
+ * ja foram removidos, pra nao deixar pastas vazias acumulando no drive.
+ */
+export async function deleteMicrosoftDriveFolderIfEmpty(destinationConfig: MicrosoftDestinationConfig, path: string, credentials?: MicrosoftCredentials) {
+  const token = await getMicrosoftToken(credentials);
+  const target = await resolveDrive(token, destinationConfig);
+  const cleanPath = path.replace(/^\/+|\/+$/g, "");
+  const lookup = await fetch(`https://graph.microsoft.com/v1.0/drives/${target.driveId}/root:/${encodePath(cleanPath)}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (lookup.status === 404) return { deleted: false, reason: "missing" as const };
+  if (!lookup.ok) {
+    const data = await lookup.json().catch(() => ({}));
+    throw new Error(data.error?.message ?? `Microsoft Graph lookup failed with ${lookup.status}`);
+  }
+  const item = await lookup.json();
+  if (!item.folder) return { deleted: false, reason: "not_a_folder" as const };
+  if ((item.folder?.childCount ?? 0) > 0) return { deleted: false, reason: "not_empty" as const };
+  await graphFetch(token, `https://graph.microsoft.com/v1.0/drives/${target.driveId}/items/${item.id}`, { method: "DELETE" });
+  return { deleted: true as const };
+}
+
 export async function downloadMicrosoftDrivePath(destinationConfig: MicrosoftDestinationConfig, path: string, localFile: string, credentials?: MicrosoftCredentials) {
   const token = await getMicrosoftToken(credentials);
   const target = await resolveDrive(token, destinationConfig);
