@@ -12,7 +12,7 @@ import { createDb } from "./db.js";
 import { decryptText, encryptText } from "./crypto.js";
 import { id, now } from "./ids.js";
 import { publicUser, withoutSecrets } from "./store.js";
-import { applyReconciliation, executeBackupRun, previewReconciliation } from "./backup.js";
+import { applyReconciliation, applyRetention, executeBackupRun, previewReconciliation } from "./backup.js";
 import { getMicrosoftDriveQuota, listMicrosoftSiteDrives, listMicrosoftSites, listMicrosoftUsers, microsoftCredentialStatus, testMicrosoftDestination } from "./microsoftGraph.js";
 import { verifyRestoreForRun } from "./restoreVerify.js";
 import { runCommand } from "./runner.js";
@@ -582,6 +582,22 @@ app.post("/api/v1/destinations/:id/reactivate", { preHandler: requireAuth }, asy
   const params = z.object({ id: z.string() }).parse(request.params);
   const destination = await db.updateDestination(params.id, { status: "untested", archivedAt: null, updatedAt: now() });
   return { destination: withoutSecrets(destination) };
+});
+
+app.post("/api/v1/destinations/:id/retention/run", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const destination = await db.getDestination(params.id);
+  if (!destination) throw new Error("Destination not found");
+  const policies = (await db.listPolicies()).filter((item) => item.destinationId === params.id);
+  if (!policies.length) throw new Error("No backup routine uses this destination");
+  const retentionRunId = id("retention");
+  const log = async (level: any, message: string, data?: Record<string, unknown>) => {
+    await db.addLog({ id: id("log"), runId: retentionRunId, level, message, data, createdAt: now() });
+  };
+  for (const policy of policies) {
+    await applyRetention(db, policy, destination, log);
+  }
+  return { retentionRunId, policiesChecked: policies.length };
 });
 
 app.post("/api/v1/destinations/:id/reconcile/preview", { preHandler: requireAuth }, async (request) => {
