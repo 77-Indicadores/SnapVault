@@ -630,6 +630,77 @@ code {
   margin-top: 20px;
 }
 
+.settingsHub {
+  display: grid;
+  gap: 28px;
+}
+
+.settingsHubGroup {
+  display: grid;
+  gap: 12px;
+}
+
+.settingsHubGroupLabel {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.settingsHubGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
+}
+
+.settingsHubCard {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  text-align: left;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.settingsHubCard:hover {
+  border-color: var(--border-strong);
+  background: var(--subtle);
+}
+
+.settingsHubCardIcon {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: var(--subtle);
+  color: var(--secondary);
+}
+
+.settingsHubCardBody {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.settingsHubCardBody strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.settingsHubCardBody span {
+  font-size: 13px;
+  color: var(--secondary);
+  line-height: 1.5;
+}
+
 .settingsStack {
   display: grid;
   gap: 16px;

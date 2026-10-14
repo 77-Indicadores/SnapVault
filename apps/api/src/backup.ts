@@ -95,6 +95,8 @@ export async function executeBackupRun(db: AppDb, runId: string, stagingRoot: st
   }
 }
 
+const RESTORE_FAILED_GRACE_DAYS = 7;
+
 async function applyRetention(db: AppDb, policy: Policy, destination: Destination, log: Logger) {
   if (destination.status === "archived") {
     await log("warn", "Retention skipped because destination is archived");
@@ -105,13 +107,20 @@ async function applyRetention(db: AppDb, policy: Policy, destination: Destinatio
   const keepDays = Math.max(0, policy.retention.keepDays);
   const allRuns = await db.listRuns();
   const policyRuns = allRuns
-    .filter((item) => item.policyId === policy.id && (item.status === "success" || item.status === "verified" || item.status === "recoverable"))
+    .filter((item) => item.policyId === policy.id && (item.status === "success" || item.status === "verified" || item.status === "recoverable" || item.status === "restore_failed"))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const protectedIds = new Set(policyRuns.slice(0, keepLast).map((item) => item.id));
   const lastRecoverable = policyRuns.find((item) => item.status === "recoverable" || item.verificationStatus === "restore_verified");
   if (lastRecoverable) protectedIds.add(lastRecoverable.id);
   const cutoff = Date.now() - keepDays * 24 * 60 * 60 * 1000;
-  const deleteRuns = policyRuns.filter((item) => !protectedIds.has(item.id) && (keepDays === 0 || Date.parse(item.createdAt) < cutoff));
+  // restore_failed runs get extra grace days on top of keepDays, so there's time to investigate before the artifact is purged.
+  const failedCutoff = cutoff - RESTORE_FAILED_GRACE_DAYS * 24 * 60 * 60 * 1000;
+  const deleteRuns = policyRuns.filter((item) => {
+    if (protectedIds.has(item.id)) return false;
+    const createdAtMs = Date.parse(item.createdAt);
+    if (item.status === "restore_failed") return createdAtMs < failedCutoff;
+    return keepDays === 0 || createdAtMs < cutoff;
+  });
   if (!deleteRuns.length) {
     await log("info", "Retention checked; nothing to delete", { keepLast, keepDays, totalRuns: policyRuns.length });
     return;
@@ -121,7 +130,7 @@ async function applyRetention(db: AppDb, policy: Policy, destination: Destinatio
   const deleteArtifacts = await db.listArtifacts();
   const toDelete = deleteArtifacts.filter((item) => deleteRunIds.includes(item.runId));
   for (const artifact of toDelete) {
-    await deleteArtifact(destination, artifact.path, microsoftCredentials);
+    await deleteArtifact(destination, artifact.path, microsoftCredentials, log);
   }
   await db.deleteArtifactsByRunIds(deleteRunIds);
   await db.deleteLogsByRunIds(deleteRunIds);
@@ -132,14 +141,100 @@ async function applyRetention(db: AppDb, policy: Policy, destination: Destinatio
   await log("info", "Retention cleanup applied", { keepLast, keepDays, deletedRuns: deleteRuns.length, deletedArtifacts: toDelete.length });
 }
 
-async function deleteArtifact(destination: Destination, path: string, microsoftCredentials?: any) {
+async function deleteArtifact(destination: Destination, path: string, microsoftCredentials?: any, log?: Logger) {
   if ((destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph") {
     await deleteMicrosoftDrivePath(destination.config as any, path, microsoftCredentials);
+    return;
+  }
+  if (destination.config?.rcloneRemoteName) {
+    const hasRclone = await commandExists("rclone");
+    if (!hasRclone) {
+      await log?.("warn", "rclone not found; cannot delete remote artifact", { path });
+      return;
+    }
+    const remote = `${destination.config.rcloneRemoteName}:${path}`;
+    const result = await runCommand("rclone", ["deletefile", remote]);
+    if (result.code !== 0) throw new Error(result.stderr || `rclone deletefile failed for ${remote}`);
     return;
   }
   if (path.startsWith("/")) {
     await rm(path, { force: true });
   }
+}
+
+type RcloneLsjsonEntry = { Path: string; IsDir: boolean };
+
+/**
+ * Passo 1 da reconciliação (somente leitura): lista o que realmente existe no destino remoto
+ * via rclone e retorna os arquivos órfãos (sem artifact correspondente no banco) sob o
+ * basePath do destino. Não apaga nada — é o preview mostrado ao usuário antes de confirmar.
+ */
+export async function previewReconciliation(db: AppDb, destination: Destination, log: Logger) {
+  if (destination.status === "archived") {
+    await log("warn", "Reconciliation preview skipped because destination is archived");
+    return { scanned: 0, orphanPaths: [] as string[] };
+  }
+  const remoteName = destination.config?.rcloneRemoteName as string | undefined;
+  if (!remoteName) {
+    await log("warn", "Reconciliation preview skipped: destination has no rclone remote configured");
+    return { scanned: 0, orphanPaths: [] as string[] };
+  }
+  const hasRclone = await commandExists("rclone");
+  if (!hasRclone) {
+    await log("warn", "Reconciliation preview skipped: rclone not found");
+    return { scanned: 0, orphanPaths: [] as string[] };
+  }
+
+  const base = String(destination.basePath || "SnapVault").replace(/^\/+|\/+$/g, "");
+  const remote = `${remoteName}:${base}`;
+  const result = await runCommand("rclone", ["lsjson", "-R", remote]);
+  if (result.code !== 0) {
+    await log("error", "Reconciliation preview failed: rclone lsjson error", { error: result.stderr });
+    return { scanned: 0, orphanPaths: [] as string[] };
+  }
+
+  let entries: RcloneLsjsonEntry[];
+  try {
+    entries = JSON.parse(result.stdout || "[]");
+  } catch (error: any) {
+    await log("error", "Reconciliation preview failed: could not parse rclone lsjson output", { error: error.message });
+    return { scanned: 0, orphanPaths: [] as string[] };
+  }
+
+  const remoteFiles = entries.filter((entry) => !entry.IsDir).map((entry) => `${base}/${entry.Path}`);
+  const knownArtifacts = await db.listArtifacts();
+  const knownPaths = new Set(knownArtifacts.filter((item) => item.destinationId === destination.id).map((item) => item.path));
+  const orphanPaths = remoteFiles.filter((path) => !knownPaths.has(path));
+
+  await log("info", "Reconciliation preview complete", { scanned: remoteFiles.length, orphans: orphanPaths.length });
+  return { scanned: remoteFiles.length, orphanPaths };
+}
+
+/**
+ * Passo 2 da reconciliação: apaga exatamente os caminhos confirmados pelo usuário a partir
+ * do preview de previewReconciliation — nunca recalcula a lista por conta própria, para que
+ * a exclusão corresponda ao que foi mostrado e confirmado na UI.
+ */
+export async function applyReconciliation(destination: Destination, confirmedPaths: string[], log: Logger) {
+  const remoteName = destination.config?.rcloneRemoteName as string | undefined;
+  if (!remoteName) {
+    await log("warn", "Reconciliation apply skipped: destination has no rclone remote configured");
+    return { deleted: 0, errors: 0 };
+  }
+  let deleted = 0;
+  let errors = 0;
+  for (const path of confirmedPaths) {
+    const result = await runCommand("rclone", ["deletefile", `${remoteName}:${path}`]);
+    if (result.code === 0) {
+      deleted += 1;
+      await log("info", "Reconciliation removed orphaned remote artifact", { path });
+    } else {
+      errors += 1;
+      await log("warn", "Reconciliation could not remove orphaned remote artifact", { path, error: result.stderr });
+    }
+  }
+  await log("info", "Reconciliation apply complete", { requested: confirmedPaths.length, deleted, errors });
+  return { deleted, errors };
 }
 
 async function verifyLocalArtifacts(source: Source, files: string[], log: Logger) {
