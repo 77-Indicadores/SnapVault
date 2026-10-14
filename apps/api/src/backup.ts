@@ -97,7 +97,7 @@ export async function executeBackupRun(db: AppDb, runId: string, stagingRoot: st
 
 const RESTORE_FAILED_GRACE_DAYS = 7;
 
-async function applyRetention(db: AppDb, policy: Policy, destination: Destination, log: Logger) {
+export async function applyRetention(db: AppDb, policy: Policy, destination: Destination, log: Logger) {
   if (destination.status === "archived") {
     await log("warn", "Retention skipped because destination is archived");
     return;

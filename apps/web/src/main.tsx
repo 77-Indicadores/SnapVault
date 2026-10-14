@@ -489,12 +489,25 @@ function StoragePage({ data, refresh, openCreate, openEdit, showNotice }: { data
   const [busy, setBusy] = useState("");
   const [reconcileTarget, setReconcileTarget] = useState<Destination | null>(null);
   const dependencyCount = (id: string) => data.policies.filter((item) => item.destinationId === id).length + data.runs.filter((item) => item.destinationId === id).length;
+  const policyCount = (id: string) => data.policies.filter((item) => item.destinationId === id).length;
   const testDestination = async (id: string) => {
     setBusy(id);
     try {
       await api(`/destinations/${id}/test`, { method: "POST", body: "{}" });
       await refresh();
       showNotice({ tone: "success", text: "Conexao testada com sucesso." });
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setBusy("");
+    }
+  };
+  const runRetention = async (destination: Destination) => {
+    setBusy(destination.id);
+    try {
+      const res = await api(`/destinations/${destination.id}/retention/run`, { method: "POST", body: "{}" });
+      await refresh();
+      showNotice({ tone: "success", text: `Retencao aplicada em ${res.policiesChecked} rotina(s).` });
     } catch (err: any) {
       showNotice({ tone: "error", text: err.message });
     } finally {
@@ -531,7 +544,7 @@ function StoragePage({ data, refresh, openCreate, openEdit, showNotice }: { data
     <>
       <PageTitle eyebrow="Storage" title="Onde salvar" text="Conexoes Microsoft usadas pelos backups. Escolha site, biblioteca e pasta sem digitar IDs." action={<button className="primaryButton" onClick={openCreate}><Plus size={15} /> Conectar</button>} />
       <section className="sectionBlock">
-        <StorageList destinations={data.destinations} dependencyCount={dependencyCount} onTest={testDestination} onEdit={openEdit} onArchive={archiveDestination} onDelete={deleteDestination} onReconcile={setReconcileTarget} busy={busy} />
+        <StorageList destinations={data.destinations} dependencyCount={dependencyCount} policyCount={policyCount} onTest={testDestination} onEdit={openEdit} onArchive={archiveDestination} onDelete={deleteDestination} onReconcile={setReconcileTarget} onRunRetention={runRetention} busy={busy} />
       </section>
       {reconcileTarget && <ReconcileModal destination={reconcileTarget} onClose={() => setReconcileTarget(null)} showNotice={showNotice} />}
     </>
@@ -1720,7 +1733,7 @@ function BackupList({ data, onRun, onPolicyOpen, onEdit, busy, limit, onToggle, 
   );
 }
 
-function StorageList({ destinations, dependencyCount, onTest, onEdit, onArchive, onDelete, onReconcile, busy }: { destinations: Destination[]; dependencyCount: (id: string) => number; onTest: (id: string) => void; onEdit: (destination: Destination) => void; onArchive: (destination: Destination) => void; onDelete: (destination: Destination) => void; onReconcile: (destination: Destination) => void; busy: string }) {
+function StorageList({ destinations, dependencyCount, policyCount, onTest, onEdit, onArchive, onDelete, onReconcile, onRunRetention, busy }: { destinations: Destination[]; dependencyCount: (id: string) => number; policyCount: (id: string) => number; onTest: (id: string) => void; onEdit: (destination: Destination) => void; onArchive: (destination: Destination) => void; onDelete: (destination: Destination) => void; onReconcile: (destination: Destination) => void; onRunRetention: (destination: Destination) => void; busy: string }) {
   if (!destinations.length) return <EmptyState title="Nenhum armazenamento" text="Conecte SharePoint ou OneDrive para salvar seus backups." />;
   return <div className="itemList">{destinations.map((destination) => {
     const deps = dependencyCount(destination.id);
@@ -1738,6 +1751,9 @@ function StorageList({ destinations, dependencyCount, onTest, onEdit, onArchive,
         <div className="rowActions">
           <button className="secondaryButton small" disabled={busy === destination.id || destination.status === "archived"} onClick={() => onTest(destination.id)}>{busy === destination.id ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} Testar</button>
           <button className="secondaryButton small" disabled={busy === destination.id} onClick={() => onEdit(destination)}><Pencil size={14} /> Editar</button>
+          {policyCount(destination.id) > 0 && destination.status !== "archived" && (
+            <button className="secondaryButton small" disabled={busy === destination.id} onClick={() => onRunRetention(destination)}><FolderClock size={14} /> Aplicar retencao</button>
+          )}
           {Boolean(destination.config?.rcloneRemoteName) && destination.status !== "archived" && (
             <button className="secondaryButton small" disabled={busy === destination.id} onClick={() => onReconcile(destination)}><ShieldCheck size={14} /> Reconciliar</button>
           )}
