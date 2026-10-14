@@ -9,7 +9,7 @@ import { decryptText, sha256File } from "./crypto.js";
 import { commandExists, runCommand } from "./runner.js";
 import { id, now } from "./ids.js";
 import type { BackupArtifact, BackupRun, Destination, JobLogEntry, Policy, Source } from "./types.js";
-import { deleteMicrosoftDrivePath, uploadToMicrosoftDrive } from "./microsoftGraph.js";
+import { deleteMicrosoftDriveFolderIfEmpty, deleteMicrosoftDrivePath, uploadToMicrosoftDrive } from "./microsoftGraph.js";
 import { verifyRestoreForRun } from "./restoreVerify.js";
 import { config } from "./config.js";
 
@@ -129,8 +129,14 @@ export async function applyRetention(db: AppDb, policy: Policy, destination: Des
   const deleteRunIds = deleteRuns.map((item) => item.id);
   const deleteArtifacts = await db.listArtifacts();
   const toDelete = deleteArtifacts.filter((item) => deleteRunIds.includes(item.runId));
+  const runDirs = new Set<string>();
   for (const artifact of toDelete) {
     await deleteArtifact(destination, artifact.path, microsoftCredentials, log);
+    const dir = artifact.path.split("/").slice(0, -1).join("/");
+    if (dir) runDirs.add(dir);
+  }
+  for (const dir of runDirs) {
+    await cleanupEmptyDir(destination, dir, microsoftCredentials, log);
   }
   await db.deleteArtifactsByRunIds(deleteRunIds);
   await db.deleteLogsByRunIds(deleteRunIds);
@@ -139,6 +145,39 @@ export async function applyRetention(db: AppDb, policy: Policy, destination: Des
     await db.pool.query(`DELETE FROM runs WHERE id = $1`, [runId]);
   }
   await log("info", "Retention cleanup applied", { keepLast, keepDays, deletedRuns: deleteRuns.length, deletedArtifacts: toDelete.length });
+}
+
+/**
+ * Depois de apagar os artifacts de um run, a pasta datada que os continha (e,
+ * recursivamente, as pastas acima dela) ficam vazias e sao lixo visual no storage.
+ * Sobe apagando enquanto cada nivel estiver vazio, parando no basePath do destino,
+ * em erro, ou quando encontra uma pasta que ainda tem conteudo (outro run, por exemplo).
+ */
+async function cleanupEmptyDir(destination: Destination, startDir: string, microsoftCredentials: any, log: Logger) {
+  const base = String(destination.basePath || "SnapVault").replace(/^\/+|\/+$/g, "");
+  const isGraph = (destination.type === "onedrive" || destination.type === "sharepoint") && destination.config.mode === "graph";
+  const remoteName = destination.config?.rcloneRemoteName as string | undefined;
+  if (!isGraph && !remoteName) return;
+
+  let current = startDir.replace(/^\/+|\/+$/g, "");
+  while (current && current !== base && current.length > base.length) {
+    try {
+      if (isGraph) {
+        const result = await deleteMicrosoftDriveFolderIfEmpty(destination.config as any, current, microsoftCredentials);
+        if (!result.deleted) break;
+      } else {
+        const result = await runCommand("rclone", ["rmdir", `${remoteName}:${current}`]);
+        if (result.code !== 0) break;
+      }
+      await log("info", "Reconciliation removed empty folder left by retention", { path: current });
+    } catch (error: any) {
+      await log("warn", "Could not remove empty folder after retention", { path: current, error: error.message });
+      break;
+    }
+    const parent = current.split("/").slice(0, -1).join("/");
+    if (!parent || parent === current) break;
+    current = parent;
+  }
 }
 
 async function deleteArtifact(destination: Destination, path: string, microsoftCredentials?: any, log?: Logger) {
@@ -223,15 +262,21 @@ export async function applyReconciliation(destination: Destination, confirmedPat
   }
   let deleted = 0;
   let errors = 0;
+  const touchedDirs = new Set<string>();
   for (const path of confirmedPaths) {
     const result = await runCommand("rclone", ["deletefile", `${remoteName}:${path}`]);
     if (result.code === 0) {
       deleted += 1;
       await log("info", "Reconciliation removed orphaned remote artifact", { path });
+      const dir = path.split("/").slice(0, -1).join("/");
+      if (dir) touchedDirs.add(dir);
     } else {
       errors += 1;
       await log("warn", "Reconciliation could not remove orphaned remote artifact", { path, error: result.stderr });
     }
+  }
+  for (const dir of touchedDirs) {
+    await cleanupEmptyDir(destination, dir, undefined, log);
   }
   await log("info", "Reconciliation apply complete", { requested: confirmedPaths.length, deleted, errors });
   return { deleted, errors };
