@@ -487,6 +487,7 @@ function BetterstackPanel({ showNotice }: { showNotice: (notice: Notice) => void
 
 function StoragePage({ data, refresh, openCreate, openEdit, showNotice }: { data: AppData; refresh: () => Promise<void>; openCreate: () => void; openEdit: (destination: Destination) => void; showNotice: (notice: Notice) => void }) {
   const [busy, setBusy] = useState("");
+  const [reconcileTarget, setReconcileTarget] = useState<Destination | null>(null);
   const dependencyCount = (id: string) => data.policies.filter((item) => item.destinationId === id).length + data.runs.filter((item) => item.destinationId === id).length;
   const testDestination = async (id: string) => {
     setBusy(id);
@@ -530,9 +531,80 @@ function StoragePage({ data, refresh, openCreate, openEdit, showNotice }: { data
     <>
       <PageTitle eyebrow="Storage" title="Onde salvar" text="Conexoes Microsoft usadas pelos backups. Escolha site, biblioteca e pasta sem digitar IDs." action={<button className="primaryButton" onClick={openCreate}><Plus size={15} /> Conectar</button>} />
       <section className="sectionBlock">
-        <StorageList destinations={data.destinations} dependencyCount={dependencyCount} onTest={testDestination} onEdit={openEdit} onArchive={archiveDestination} onDelete={deleteDestination} busy={busy} />
+        <StorageList destinations={data.destinations} dependencyCount={dependencyCount} onTest={testDestination} onEdit={openEdit} onArchive={archiveDestination} onDelete={deleteDestination} onReconcile={setReconcileTarget} busy={busy} />
       </section>
+      {reconcileTarget && <ReconcileModal destination={reconcileTarget} onClose={() => setReconcileTarget(null)} showNotice={showNotice} />}
     </>
+  );
+}
+
+function ReconcileModal({ destination, onClose, showNotice }: { destination: Destination; onClose: () => void; showNotice: (notice: Notice) => void }) {
+  const [loading, setLoading] = useState(true);
+  const [applying, setApplying] = useState(false);
+  const [scanned, setScanned] = useState(0);
+  const [orphanPaths, setOrphanPaths] = useState<string[]>([]);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError("");
+      try {
+        const res = await api(`/destinations/${destination.id}/reconcile/preview`, { method: "POST", body: "{}" });
+        if (!cancelled) {
+          setScanned(res.scanned);
+          setOrphanPaths(res.orphanPaths);
+        }
+      } catch (err: any) {
+        if (!cancelled) setError(err.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [destination.id]);
+
+  const apply = async () => {
+    setApplying(true);
+    try {
+      const res = await api(`/destinations/${destination.id}/reconcile/apply`, { method: "POST", body: JSON.stringify({ paths: orphanPaths }) });
+      showNotice({ tone: "success", text: `Reconciliacao concluida: ${res.deleted} arquivo(s) removido(s)${res.errors ? `, ${res.errors} erro(s)` : ""}.` });
+      onClose();
+    } catch (err: any) {
+      showNotice({ tone: "error", text: err.message });
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  return (
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label={`Reconciliar ${destination.name}`} onClick={onClose}>
+      <div className="wizard compactWizard" onClick={(e) => e.stopPropagation()}>
+        <header className="wizardHeader"><div><span>Storage</span><h2><ShieldCheck size={18} /> Reconciliar {destination.name}</h2></div><button className="iconOnly" onClick={onClose} aria-label="Fechar"><X size={18} /></button></header>
+        <p>Compara o que existe de fato no armazenamento remoto com os registros do banco e lista arquivos orfaos (sem registro correspondente) sob <code>{destination.basePath}</code>. Nada e apagado ate voce confirmar.</p>
+        {loading && <p><Loader2 className="spin" size={14} /> Escaneando armazenamento remoto...</p>}
+        {!loading && error && <p className="formError">{error}</p>}
+        {!loading && !error && (
+          <>
+            <p>{scanned} arquivo(s) encontrado(s) no remoto · <strong>{orphanPaths.length} orfao(s)</strong> sem registro no banco.</p>
+            {orphanPaths.length > 0 && (
+              <div className="reviewBox compactReview" style={{ maxHeight: 220, overflowY: "auto" }}>
+                {orphanPaths.map((path) => <ReviewRow key={path} label="" value={path} />)}
+              </div>
+            )}
+          </>
+        )}
+        <footer className="wizardFooter">
+          <button className="secondaryButton" onClick={onClose} disabled={applying}>Cancelar</button>
+          {!loading && !error && orphanPaths.length > 0 && (
+            <button className="primaryButton" disabled={applying} onClick={apply}>
+              {applying ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />} Apagar {orphanPaths.length} arquivo(s)
+            </button>
+          )}
+        </footer>
+      </div>
+    </div>
   );
 }
 
@@ -655,7 +727,55 @@ const TIMEZONE_OPTIONS = [
   { value: "Europe/London", label: "Londres (GMT / BST)" },
 ];
 
+type SettingsSectionId = "account" | "security" | "timezone" | "users" | "microsoft" | "betterstack";
+
+type SettingsCardDef = {
+  id: SettingsSectionId;
+  icon: React.ReactNode;
+  title: string;
+  text: string;
+  adminOnly?: boolean;
+};
+
+type SettingsGroupDef = {
+  label: string;
+  cards: SettingsCardDef[];
+};
+
+const SETTINGS_GROUPS: SettingsGroupDef[] = [
+  {
+    label: "Conta",
+    cards: [
+      { id: "account", icon: <UserRoundIcon />, title: "Minha conta", text: "Email, perfil e troca de senha." },
+    ],
+  },
+  {
+    label: "Sistema",
+    cards: [
+      { id: "timezone", icon: <FolderClock size={18} />, title: "Timezone", text: "Fuso usado em agendamentos e no relogio da barra superior." },
+    ],
+  },
+  {
+    label: "Seguranca & acesso",
+    cards: [
+      { id: "users", icon: <KeyRound size={18} />, title: "Usuarios", text: "Crie, edite e controle o acesso de usuarios a plataforma.", adminOnly: true },
+    ],
+  },
+  {
+    label: "Integracoes",
+    cards: [
+      { id: "microsoft", icon: <Cloud size={18} />, title: "Microsoft 365", text: "Tenant, client ID e secret usados pelos destinos SharePoint/OneDrive." },
+      { id: "betterstack", icon: <Settings size={18} />, title: "Logs (Betterstack)", text: "Token e host de ingestao para encaminhar logs da aplicacao." },
+    ],
+  },
+];
+
+function UserRoundIcon() {
+  return <ShieldCheck size={18} />;
+}
+
 function SettingsPage({ user, showNotice, timezone, onTimezoneChange }: { user: any; showNotice: (notice: Notice) => void; timezone: string; onTimezoneChange: (tz: string) => void }) {
+  const [section, setSection] = useState<SettingsSectionId | "">("");
   const [tzBusy, setTzBusy] = useState(false);
 
   const saveTimezone = async (tz: string) => {
@@ -671,37 +791,79 @@ function SettingsPage({ user, showNotice, timezone, onTimezoneChange }: { user: 
     }
   };
 
+  if (section) {
+    const card = SETTINGS_GROUPS.flatMap((g) => g.cards).find((c) => c.id === section);
+    return (
+      <>
+        <PageTitle
+          eyebrow="Settings"
+          title={card?.title ?? "Configuracoes"}
+          text={card?.text ?? ""}
+          action={<button className="secondaryButton" onClick={() => setSection("")}><ChevronLeft size={15} /> Voltar</button>}
+        />
+        <section className="settingsStack">
+          {section === "account" && (
+            <>
+              <section className="card">
+                <SectionHeader title="Conta" />
+                <div className="reviewBox compactReview">
+                  <ReviewRow label="Email" value={user.email} />
+                  <ReviewRow label="Perfil" value={user.role} />
+                </div>
+              </section>
+              <MyAccountPanel showNotice={showNotice} currentUser={user} />
+            </>
+          )}
+          {section === "timezone" && (
+            <section className="card">
+              <SectionHeader title="Timezone" />
+              <div className="settingsRow">
+                <div>
+                  <strong>Timezone</strong>
+                  <span>Referencia para agendamentos e exibicao de horarios. O relogio na barra reflete este fuso.</span>
+                </div>
+                <div className="tzSelector">
+                  <select value={timezone} onChange={(e) => saveTimezone(e.target.value)} disabled={tzBusy}>
+                    {TIMEZONE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                  </select>
+                  {tzBusy && <Loader2 className="spin" size={15} />}
+                </div>
+              </div>
+            </section>
+          )}
+          {section === "users" && <UsersPanel showNotice={showNotice} currentUser={user} />}
+          {section === "microsoft" && <MicrosoftIntegrationsPanel showNotice={showNotice} />}
+          {section === "betterstack" && <BetterstackPanel showNotice={showNotice} />}
+        </section>
+      </>
+    );
+  }
+
   return (
     <>
-      <PageTitle eyebrow="Settings" title="Configuracoes" text="Conta, sistema e integracoes." />
-      <section className="settingsStack">
-        <section className="card">
-          <SectionHeader title="Conta" />
-          <div className="reviewBox compactReview">
-            <ReviewRow label="Email" value={user.email} />
-            <ReviewRow label="Perfil" value={user.role} />
-          </div>
-        </section>
-        <section className="card">
-          <SectionHeader title="Sistema" />
-          <div className="settingsRow">
-            <div>
-              <strong>Timezone</strong>
-              <span>Referencia para agendamentos e exibicao de horarios. O relogio na barra reflete este fuso.</span>
-            </div>
-            <div className="tzSelector">
-              <select value={timezone} onChange={(e) => saveTimezone(e.target.value)} disabled={tzBusy}>
-                {TIMEZONE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-              </select>
-              {tzBusy && <Loader2 className="spin" size={15} />}
-            </div>
-          </div>
-        </section>
-        <UsersPanel showNotice={showNotice} currentUser={user} />
-        <MyAccountPanel showNotice={showNotice} currentUser={user} />
-        <MicrosoftIntegrationsPanel showNotice={showNotice} />
-        <BetterstackPanel showNotice={showNotice} />
-      </section>
+      <PageTitle eyebrow="Settings" title="Configuracoes" text="Gerencie conta, sistema e integracoes da plataforma." />
+      <div className="settingsHub">
+        {SETTINGS_GROUPS.map((group) => {
+          const cards = group.cards.filter((c) => !c.adminOnly || user.role === "admin");
+          if (!cards.length) return null;
+          return (
+            <section key={group.label} className="settingsHubGroup">
+              <h4 className="settingsHubGroupLabel">{group.label}</h4>
+              <div className="settingsHubGrid">
+                {cards.map((c) => (
+                  <button key={c.id} className="settingsHubCard" onClick={() => setSection(c.id)}>
+                    <span className="settingsHubCardIcon">{c.icon}</span>
+                    <span className="settingsHubCardBody">
+                      <strong>{c.title}</strong>
+                      <span>{c.text}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          );
+        })}
+      </div>
     </>
   );
 }
@@ -1558,7 +1720,7 @@ function BackupList({ data, onRun, onPolicyOpen, onEdit, busy, limit, onToggle, 
   );
 }
 
-function StorageList({ destinations, dependencyCount, onTest, onEdit, onArchive, onDelete, busy }: { destinations: Destination[]; dependencyCount: (id: string) => number; onTest: (id: string) => void; onEdit: (destination: Destination) => void; onArchive: (destination: Destination) => void; onDelete: (destination: Destination) => void; busy: string }) {
+function StorageList({ destinations, dependencyCount, onTest, onEdit, onArchive, onDelete, onReconcile, busy }: { destinations: Destination[]; dependencyCount: (id: string) => number; onTest: (id: string) => void; onEdit: (destination: Destination) => void; onArchive: (destination: Destination) => void; onDelete: (destination: Destination) => void; onReconcile: (destination: Destination) => void; busy: string }) {
   if (!destinations.length) return <EmptyState title="Nenhum armazenamento" text="Conecte SharePoint ou OneDrive para salvar seus backups." />;
   return <div className="itemList">{destinations.map((destination) => {
     const deps = dependencyCount(destination.id);
@@ -1576,6 +1738,9 @@ function StorageList({ destinations, dependencyCount, onTest, onEdit, onArchive,
         <div className="rowActions">
           <button className="secondaryButton small" disabled={busy === destination.id || destination.status === "archived"} onClick={() => onTest(destination.id)}>{busy === destination.id ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} Testar</button>
           <button className="secondaryButton small" disabled={busy === destination.id} onClick={() => onEdit(destination)}><Pencil size={14} /> Editar</button>
+          {Boolean(destination.config?.rcloneRemoteName) && destination.status !== "archived" && (
+            <button className="secondaryButton small" disabled={busy === destination.id} onClick={() => onReconcile(destination)}><ShieldCheck size={14} /> Reconciliar</button>
+          )}
           <button className="secondaryButton small" disabled={busy === destination.id} onClick={() => destination.status === "archived" ? onArchive(destination) : deps > 0 ? onArchive(destination) : onDelete(destination)}>{destination.status === "archived" ? <RefreshCw size={14} /> : <Trash2 size={14} />} {destination.status === "archived" ? "Reativar" : deps > 0 ? "Arquivar" : "Excluir"}</button>
         </div>
       </article>

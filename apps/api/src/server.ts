@@ -12,7 +12,7 @@ import { createDb } from "./db.js";
 import { decryptText, encryptText } from "./crypto.js";
 import { id, now } from "./ids.js";
 import { publicUser, withoutSecrets } from "./store.js";
-import { executeBackupRun } from "./backup.js";
+import { applyReconciliation, executeBackupRun, previewReconciliation } from "./backup.js";
 import { getMicrosoftDriveQuota, listMicrosoftSiteDrives, listMicrosoftSites, listMicrosoftUsers, microsoftCredentialStatus, testMicrosoftDestination } from "./microsoftGraph.js";
 import { verifyRestoreForRun } from "./restoreVerify.js";
 import { runCommand } from "./runner.js";
@@ -582,6 +582,31 @@ app.post("/api/v1/destinations/:id/reactivate", { preHandler: requireAuth }, asy
   const params = z.object({ id: z.string() }).parse(request.params);
   const destination = await db.updateDestination(params.id, { status: "untested", archivedAt: null, updatedAt: now() });
   return { destination: withoutSecrets(destination) };
+});
+
+app.post("/api/v1/destinations/:id/reconcile/preview", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const destination = await db.getDestination(params.id);
+  if (!destination) throw new Error("Destination not found");
+  const reconcileRunId = id("reconcile");
+  const log = async (level: any, message: string, data?: Record<string, unknown>) => {
+    await db.addLog({ id: id("log"), runId: reconcileRunId, level, message, data, createdAt: now() });
+  };
+  const { scanned, orphanPaths } = await previewReconciliation(db, destination, log);
+  return { reconcileRunId, scanned, orphanPaths };
+});
+
+app.post("/api/v1/destinations/:id/reconcile/apply", { preHandler: requireAuth }, async (request) => {
+  const params = z.object({ id: z.string() }).parse(request.params);
+  const body = z.object({ paths: z.array(z.string()).min(1) }).parse(request.body);
+  const destination = await db.getDestination(params.id);
+  if (!destination) throw new Error("Destination not found");
+  const reconcileRunId = id("reconcile");
+  const log = async (level: any, message: string, data?: Record<string, unknown>) => {
+    await db.addLog({ id: id("log"), runId: reconcileRunId, level, message, data, createdAt: now() });
+  };
+  const { deleted, errors } = await applyReconciliation(destination, body.paths, log);
+  return { reconcileRunId, deleted, errors };
 });
 
 // ── Policies ──────────────────────────────────────────────────────────────────
