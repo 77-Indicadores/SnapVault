@@ -1,0 +1,60 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file:
+      - .env
+    environment:
+      PORT: 4000
+      HOST: 0.0.0.0
+      SNAPVAULT_DATABASE_PATH: /data/snapvault.json
+      SNAPVAULT_STAGING_DIR: /staging
+      SNAPVAULT_WEB_ORIGIN: http://localhost:18080
+      SNAPVAULT_SECRET_KEY: ${SNAPVAULT_SECRET_KEY:-local-dev-secret}
+    volumes:
+      - snapvault-data:/data
+      - snapvault-staging:/staging
+      - ./tmp/rclone:/config/rclone
+    ports:
+      - "14100:4000"
+    depends_on:
+      - postgres
+      - minio
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports:
+      - "18080:80"
+    depends_on:
+      - api
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  minio:
+    # A MinIO parou de publicar a edicao community no Docker Hub e no quay.io em 2025/2026
+    # (ambos retornam "unauthorized" para qualquer tag). cgr.dev/chainguard/minio e o
+    # substituto gratuito e publico recomendado pela propria comunidade.
+    image: cgr.dev/chainguard/minio:latest
+    user: "0"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+
+volumes:
+  snapvault-data:
+  snapvault-staging:
+  pg-data:
+  minio-data:
